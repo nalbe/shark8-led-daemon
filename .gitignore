@@ -1,0 +1,24 @@
+# Gradle / Android build
+.gradle/
+build/
+local.properties
+*.apk
+!module/nls.apk
+!module/led_gui.apk
+
+# Kotlin
+.kotlin/
+
+# Build artifacts
+*.zip
+*.rar
+
+# OS junk
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Miscellaneous
+.tmp
+.git
+release

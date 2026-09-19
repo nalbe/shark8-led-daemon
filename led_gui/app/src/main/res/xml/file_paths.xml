@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Status tab: the daemon log is copied into the app cache before
+         being handed to a text viewer via FileProvider. -->
+    <cache-path name="logs" path="logs/" />
+</paths>
