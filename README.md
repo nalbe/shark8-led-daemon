@@ -12,8 +12,9 @@ Both companion apps ship inside the flashable zip, but only one of them
 is this project's:
 
 - **NotifyBridge** (`notifybridge-release.apk`, `com.bastet.notifybridge`) - the required headless
-  notification bridge. It is a **standalone project**
-  (`android-notify-bridge` repo); this repo only consumes its `notifybridge-release.apk` artifact.
+  notification bridge. It is a **standalone project** - the
+  [android-notify-bridge](https://github.com/nalbe/android-notify-bridge) repo;
+  this repo only consumes its `notifybridge-release.apk` artifact.
 - **LED GUI** (`led_gui-release.apk`, `com.bastet.ledgui`) - the optional
   configurator. **This** project's app, lives here under `led_gui/`.
 
