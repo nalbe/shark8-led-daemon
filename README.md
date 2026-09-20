@@ -219,9 +219,13 @@ on the next daemon event, no restart, no rebuild. Requires root
 | --- | --- |
 | <img src="screenshots/03-call.png" width="270"> | <img src="screenshots/04-alarm.png" width="270"> |
 
-| Notification | LED GUI |
+| Notification | Notification (alternate capture) |
 | --- | --- |
-| <img src="screenshots/06-notification.png" width="270"> | <img src="screenshots/08.png" width="270"> |
+| <img src="screenshots/06-notification.png" width="270"> | <img src="screenshots/07-notification.png" width="270"> |
+
+| Alarm (alternate capture) | LED GUI |
+| --- | --- |
+| <img src="screenshots/05-alarm.png" width="270"> | <img src="screenshots/08.png" width="270"> |
 
 ## Build from source
 
