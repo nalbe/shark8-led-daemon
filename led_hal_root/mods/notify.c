@@ -37,15 +37,15 @@
 
 /* ---------------- registry lookups ---------------- */
 
-/* colour for a package: [rules] in led.conf, then internal pseudo-package
- * registry (missed.call), then the [notify] default_color. Returns 1 when
- * a per-package rule supplied the color (the "app" preset is used), 0 for
- * the shared default color (the "default" preset). */
+/* colour for a package: [rules] in led.conf, then any built-in registry
+ * entry (extension point; currently none), then the [notify] default_color.
+ * Returns 1 when a per-package rule supplied the color (the "app" preset
+ * is used), 0 for the shared default color (the "default" preset). */
 static int rgb_for(const char *pkg, int *r, int *g, int *b)
 {
     if (conf_pkg_rgb(pkg, r, g, b)) return 1;
     const struct led_rule *lr;
-    for (lr = __start_chgd_rules; lr < __stop_chgd_rules; lr++)
+    for (lr = __start_chgd_rules; lr->pkg; lr++)
         if (!strcmp(lr->pkg, pkg)) {
             *r = lr->r; *g = lr->g; *b = lr->b;
             return 1;
@@ -111,7 +111,7 @@ void arm_notification_ex(struct notif_state *st, const char *pkg, int test)
      * [notify] default preset. */
     int app  = rgb_for(pkg, &r, &g, &b);
     const char *sec = app ? "notify.app" : "notify";
-    LOGI("arm detect: %s -> [%s] rgb=%d,%d,%d (rules|internal|default)",
+    LOGI("arm detect: %s -> [%s] rgb=%d,%d,%d (rules|default)",
          pkg, sec, r, g, b);
     g_applied_band[0] = '\0';       /* LEDs taken over: force reapply later */
     /* led_event() resolves the active [sec] mode and paints via the
@@ -171,7 +171,7 @@ static int notify_owns(const char *pkg)
      * (notify_next_wake): a 1s poll only while a top is parked and the
      * NLS bridge has not been feeding us ACTION_SCREEN events; with the
      * bridge alive the SCREEN command is the edge, so we sleep until the
-     * next real cap deadline (or a single WATCHDOG_SEC pass). */
+     * next real cap deadline or nothing at all (event-driven disarm). */
     if (!pkg || !pkg[0])
         return queue_has_pending() || queue_active();
     if (ring_is_active()) return 0;     /* ring owns its pseudo-pkg */
@@ -198,12 +198,12 @@ static void notify_tick(void)
  *                              (queue_arbitrate drops the park once it ages)
  *   parked top + NLS screen event -> 0: the SCREEN 0 command from the app
  *                              IS the edge that flashes the park, so the
- *                              core just keeps its WATCHDOG_SEC safety pass.
+ *                              core disarms the timer completely.
  *   active entry with a cap -> wake exactly when it expires
  *   active entry, no cap    -> 0: no deadline at all, disarm is
- *                              event-driven (a CAN). The core turns that
- *                              into a single WATCHDOG_SEC safety pass -
- *                              never a 1s tick per second forever.
+ *                              event-driven (a CAN) and the timer stays
+ *                              disarmed - the LED just sits there and the
+ *                              phone sleeps.
  * Returns 0 when nothing time-bound is pending. */
 static long notify_next_wake(void)
 {

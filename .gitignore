@@ -3,8 +3,8 @@
 build/
 local.properties
 *.apk
-!module/nls.apk
-!module/led_gui.apk
+!module/notifybridge-release.apk
+!module/led_gui-release.apk
 
 # Kotlin
 .kotlin/

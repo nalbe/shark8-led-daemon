@@ -1,20 +1,24 @@
 @echo off
 rem ============================================================
-rem  install_gui.cmd - install the LED GUI app to a connected
-rem  device. Builds the APK first if it is missing.
+rem  install_gui.cmd - build the LED GUI APK (release, R8
+rem  minified, signed with the debug keystore), stage it into
+rem  module\led_gui-release.apk (what customize.sh installs) and
+rem  install it on a connected device. Builds the APK first if it
+rem  is missing.
 rem ============================================================
 setlocal enabledelayedexpansion
 set "GUI=%~dp0led_gui"
-set "APK=%GUI%\app\build\outputs\apk\debug\app-debug.apk"
+set "APK=%GUI%\app\build\outputs\apk\release\led_gui-release.apk"
+set "DST=%~dp0module\led_gui-release.apk"
 
 if not exist "%APK%" (
     echo APK not built - building with gradle...
     pushd "%GUI%"
     where gradle >nul 2>nul
     if errorlevel 1 (
-        call "D:\System\Apps\gradle-8.12\bin\gradle.bat" assembleDebug
+        call "D:\System\Apps\gradle-8.12\bin\gradle.bat" assembleRelease
     ) else (
-        call gradle assembleDebug
+        call gradle assembleRelease
     )
     set "RC=!ERRORLEVEL!"
     popd
@@ -27,6 +31,10 @@ if not exist "%APK%" (
 echo Waiting for device...
 adb wait-for-device
 if errorlevel 1 goto :noadb
+
+copy /y "%APK%" "%DST%" >nul
+if errorlevel 1 goto :fail
+echo STAGED: %DST%
 
 echo Installing %APK%
 adb install -r "%APK%"

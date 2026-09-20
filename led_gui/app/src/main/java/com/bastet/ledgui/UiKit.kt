@@ -31,14 +31,27 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 
-/** AW2033 color simulation for previews: the chip scales each channel's
- *  drive current (0..15) against the color's PWM amplitude (0..255), so
- *  the eye sees color * cur/15 per channel. cur=15 reproduces the raw
- *  color exactly; a zeroed channel goes dark. */
+/** AW2033 color simulation for previews. The chip scales each channel's
+ *  drive current (0..15) against the color's PWM amplitude (0..255); the
+ *  eye sees that optical output through each LED's own luminous weight
+ *  and a perception curve. [Cal] is driven by [preview] in led.conf and
+ *  set from LedConf.parse - green=100 is the reference weight.
+ *  syncMode=true models LCFG0.SYNC: the master (red) PWM drives every
+ *  channel while per-channel current stays alive. */
 object LedSim {
-    fun rgbWithCurrent(c: Triple<Int, Int, Int>, cur: Triple<Int, Int, Int>): Triple<Int, Int, Int> {
-        fun ch(v: Int, kw: Int) = (v * kw / 15f).roundToInt().coerceIn(0, 255)
-        return Triple(ch(c.first, cur.first), ch(c.second, cur.second), ch(c.third, cur.third))
+    class Cal(val r: Double, val g: Double, val b: Double, val gamma: Double)
+
+    @Volatile
+    var cal = Cal(0.5, 1.0, 0.8, 2.2)
+
+    fun rgbWithCurrent(c: Triple<Int, Int, Int>, cur: Triple<Int, Int, Int>, syncMode: Boolean = false): Triple<Int, Int, Int> {
+        val w = arrayOf(cal.r, cal.g, cal.b)
+        fun ch(i: Int): Int {
+            val duty = if (syncMode) c.first else when (i) { 0 -> c.first; 1 -> c.second; else -> c.third }
+            val opt = duty / 255.0 * (when (i) { 0 -> cur.first; 1 -> cur.second; else -> cur.third }) / 15.0 * w[i]
+            return (255.0 * Math.pow(opt, 1.0 / cal.gamma).coerceIn(0.0, 1.0)).roundToInt().coerceIn(0, 255)
+        }
+        return Triple(ch(0), ch(1), ch(2))
     }
 }
 
@@ -80,7 +93,39 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
      *  switches, so the screen never re-paints over your edits. */
     private fun initData() {
         val cached = LedConf.cached()
-        if (cached != null) applyTo(cached) else reload()
+        if (cached != null) {
+            applyTo(cached)
+        } else {
+            reload()
+            selfHealWhenRoot()
+        }
+    }
+
+    /** This page was built before root answered (cold start right after a
+     *  grant, adbd restart, module reinstall). The old code loaded exactly
+     *  once at build time, so an empty page stayed empty - the app-wide
+     *  cache only ever got warm from the Info poll or a manual Reload, and
+     *  the Info poll only runs while that tab is VISIBLE. Retry in the
+     *  background until the device config answers, then paint once through
+     *  the shared cache so every page gets the same data. Bounded (~2 min)
+     *  so a truly rootless page does not hammer su forever. */
+    private fun selfHealWhenRoot() {
+        scope.launch {
+            for (attempt in 0 until 90) {
+                delay(1500)
+                val c = LedConf.cached()
+                if (c != null) {
+                    applyTo(c)
+                    return@launch
+                }
+                val fresh = withContext(Dispatchers.IO) { LedConf.loadOrNull() }
+                if (fresh != null) {
+                    LedConf.updateCache(fresh)
+                    applyTo(fresh)
+                    return@launch
+                }
+            }
+        }
     }
 
     private lateinit var saveBtn: Button
@@ -174,7 +219,10 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
             }
             setBtnBusy(reloadBtn, false, "")
             if (c == null) {
-                showMsg("load failed: root not granted? Press Reload after granting.", error = true)
+                showMsg(
+                    "load failed: root not granted yet - " +
+                        "config auto-loads once the grant lands.", error = true
+                )
                 return@launch
             }
             applyTo(c)
@@ -364,6 +412,17 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
         return f
     }
 
+    /** Named checkbox row (dark-theme match for the RenderCard knobs). */
+    protected fun LinearLayout.syncCheck(label: String): CheckBox {
+        val cb = CheckBox(context)
+        cb.text = label
+        cb.setTextColor(parse("#FFB0BEC5"))
+        cb.textSize = 13f
+        cb.isChecked = false
+        addView(cb)
+        return cb
+    }
+
     /** Generic radio group over arbitrary names - the LED tab uses it for
      *  the [led] mode (off/solid/breath/wave) and Imax (5/10/15/30) picks. */
     protected inner class NamePicker(
@@ -406,9 +465,17 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
         private var color = Triple(255, 0, 0)
 
         /** Per-channel LED current (0..15) the event's chip runs at. The
-         *  swatch previews color * cur/15, so the user sees the light the
-         *  combination actually produces, not the raw picker color. */
+         *  swatch previews the optical result (weight + gamma), so the user
+         *  sees the light the combination actually produces. */
         var previewCur: Triple<Int, Int, Int> = Triple(15, 15, 15)
+            set(v) {
+                field = v
+                paintSwatch()
+            }
+
+        /** true = LCFG0.SYNC armed: the master (red) PWM drives all three
+         *  LEDs, the picker's G/B sliders are locked to red. */
+        var pwmSync: Boolean = false
             set(v) {
                 field = v
                 paintSwatch()
@@ -470,8 +537,14 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
 
         private fun paintSwatch() {
             val g = swatch.background as? GradientDrawable ?: return
-            val s = LedSim.rgbWithCurrent(color, previewCur)
+            val s = LedSim.rgbWithCurrent(color, previewCur, pwmSync)
             g.setColor(Color.rgb(s.first, s.second, s.third))
+        }
+
+        /** Lock/unlock one channel's slider (sync keeps only red live). */
+        fun setChannelEnabled(i: Int, enabled: Boolean) {
+            sliders[i].interactive = enabled
+            valueTvs[i].setTextColor(parse(if (enabled) "#FFE0E0E0" else "#FF727272"))
         }
 
         fun setColor(c: Triple<Int, Int, Int>) {
@@ -500,9 +573,18 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
                 invalidate()
             }
 
+        /** false = locked channel (sync): touch is ignored, drawn grey. */
+        var interactive = true
+            set(v) {
+                field = v
+                invalidate()
+            }
+
         private val trackPaint = Paint().apply { color = parse("#FF333A46"); isAntiAlias = true }
         private val fillPaint = Paint().apply { color = channelColor; isAntiAlias = true }
+        private val fillOffPaint = Paint().apply { color = parse("#FF3A3A3A"); isAntiAlias = true }
         private val thumbPaint = Paint().apply { color = parse("#FFF0F0F0"); isAntiAlias = true }
+        private val thumbOffPaint = Paint().apply { color = parse("#FF8A8A8A"); isAntiAlias = true }
 
         init {
             setMinimumHeight(dpi(50))
@@ -518,11 +600,17 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
             val range = right - left
             val thumbX = left + range * (progress / 255f)
             canvas.drawRoundRect(RectF(left, cy - t / 2f, right, cy + t / 2f), t / 2f, t / 2f, trackPaint)
-            canvas.drawRoundRect(RectF(left, cy - t / 2f, thumbX, cy + t / 2f), t / 2f, t / 2f, fillPaint)
-            canvas.drawCircle(thumbX, cy, dpi(11).toFloat(), thumbPaint)
+            if (interactive) {
+                canvas.drawRoundRect(RectF(left, cy - t / 2f, thumbX, cy + t / 2f), t / 2f, t / 2f, fillPaint)
+                canvas.drawCircle(thumbX, cy, dpi(11).toFloat(), thumbPaint)
+            } else {
+                canvas.drawRoundRect(RectF(left, cy - t / 2f, thumbX, cy + t / 2f), t / 2f, t / 2f, fillOffPaint)
+                canvas.drawCircle(thumbX, cy, dpi(11).toFloat(), thumbOffPaint)
+            }
         }
 
         override fun onTouchEvent(e: MotionEvent): Boolean {
+            if (!interactive) return false
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     parent?.requestDisallowInterceptTouchEvent(true)
@@ -600,6 +688,12 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
             edits[2].setText(t.third.toString())
         }
 
+        /** Lock/unlock one field (sync keeps only the red one live). */
+        fun setFieldEnabled(i: Int, enabled: Boolean) {
+            edits[i].isEnabled = enabled
+            edits[i].setTextColor(parse(if (enabled) "#FFE0E0E0" else "#FF727272"))
+        }
+
         fun getTriple(def: Triple<Int, Int, Int>): Triple<Int, Int, Int> = Triple(
             edits[0].text.toString().toIntOrNull() ?: def.first,
             edits[1].text.toString().toIntOrNull() ?: def.second,
@@ -640,6 +734,8 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
             private set
         lateinit var brOfft: NumField
             private set
+        lateinit var brSync: CheckBox
+            private set
         lateinit var waveT0: TripleField
             private set
         lateinit var waveRepeat: NumField
@@ -651,6 +747,8 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
         lateinit var waveFall: NumField
             private set
         lateinit var waveOfft: NumField
+            private set
+        lateinit var waveSync: CheckBox
             private set
 
         init {
@@ -681,9 +779,11 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
             breathCard = card {
                 addView(sectionTitle("Breath param"))
                 addView(spacer(4))
-                addView(text("Chip-driven breathing. Timing is owned by [sec.breath] (no fallback).", 12f, parse("#FF727272")))
+                addView(text("Chip-driven breathing. Timing is owned by [sec.breath] (no fallback). Sync moves ALL channels onto the red (master) PWM; color = per-channel cur ratio.", 12f, parse("#FF727272")))
                 addView(spacer(2))
                 brRepeat = numRow("repeat (0 = infinite, 1..15)", "0")
+                addView(spacer(2))
+                brSync = syncCheck("sync: all channels on master red PWM")
                 addView(spacer(2))
                 brCur = TripleField("current (amps) r,g,b (0-15)", Triple(15, 15, 15))
                 addView(brCur)
@@ -699,12 +799,14 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
             waveCard = card {
                 addView(sectionTitle("Wave param"))
                 addView(spacer(4))
-                addView(text("Breathing with a per-channel t0 phase lag = traveling rainbow. Timing is owned by [sec.wave] (no fallback).", 12f, parse("#FF727272")))
+                addView(text("Breathing with a per-channel t0 phase lag = traveling rainbow. Timing is owned by [sec.wave] (no fallback). Sync moves ALL channels onto the red (master) PWM; color = per-channel cur ratio.", 12f, parse("#FF727272")))
                 addView(spacer(2))
                 waveT0 = TripleField("channel phase t0 (ms)", Triple(0, 1300, 2600))
                 addView(waveT0)
                 addView(spacer(2))
                 waveRepeat = numRow("repeat (0 = infinite, 1..15)", "0")
+                addView(spacer(2))
+                waveSync = syncCheck("sync: all channels on master red PWM")
                 addView(spacer(2))
                 waveRise = numRow("rise (ms)", "500")
                 addView(spacer(2))
@@ -718,9 +820,31 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
             addView(breathCard)
             addView(waveCard)
             syncMode()
+            brSync.setOnCheckedChangeListener { _, _ -> applySyncGray() }
+            waveSync.setOnCheckedChangeListener { _, _ -> applySyncGray() }
+            applySyncGray()
             solidCur.onChanged = { refreshPreview() }
             brCur.onChanged = { refreshPreview() }
             if (color != null) attachPreview(color!!)
+        }
+
+        /** Sync (LCFG0.SYNC) puts G/B PWM and t0 onto the red master, so the
+         *  G/B knobs are dead on the chip while sync is on: grey them out
+         *  and steer the swatch's duty from red alone. cur stays per-channel
+         *  (it still lives under sync), so it is left editable. */
+        private fun applySyncGray() {
+            val sync = (modeNames[mode.get()] == "breath" && brSync.isChecked) ||
+                (modeNames[mode.get()] == "wave" && waveSync.isChecked)
+            val p = color ?: previewTarget
+            if (p != null) {
+                p.pwmSync = sync
+                p.setChannelEnabled(0, true)
+                p.setChannelEnabled(1, !sync)
+                p.setChannelEnabled(2, !sync)
+            }
+            waveT0.setFieldEnabled(0, true)
+            waveT0.setFieldEnabled(1, !sync)
+            waveT0.setFieldEnabled(2, !sync)
         }
 
         /** The current triple the active mode actually drives. solid and
@@ -735,6 +859,7 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
 
         fun attachPreview(p: RgbPicker) {
             previewTarget = p
+            applySyncGray()
             refreshPreview()
         }
 
@@ -747,6 +872,7 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
             solidCard.visibility = if (m == "solid") VISIBLE else GONE
             breathCard.visibility = if (m == "breath") VISIBLE else GONE
             waveCard.visibility = if (m == "wave") VISIBLE else GONE
+            applySyncGray()
             refreshPreview()
         }
 
@@ -761,12 +887,14 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
             brHold.setText(r.brHold.toString())
             brFall.setText(r.brFall.toString())
             brOfft.setText(r.brOfft.toString())
+            brSync.isChecked = r.brSync
             waveT0.setTriple(r.waveT0)
             waveRepeat.setText(r.waveRepeat.toString())
             waveRise.setText(r.waveRise.toString())
             waveHold.setText(r.waveHold.toString())
             waveFall.setText(r.waveFall.toString())
             waveOfft.setText(r.waveOfft.toString())
+            waveSync.isChecked = r.waveSync
             syncMode()
         }
 
@@ -783,12 +911,14 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
             r.brHold = brHold.getInt(100)
             r.brFall = brFall.getInt(500)
             r.brOfft = brOfft.getInt(1200)
+            r.brSync = brSync.isChecked
             r.waveT0 = waveT0.getTriple(Triple(0, 1300, 2600))
             r.waveRepeat = waveRepeat.getInt(0).coerceIn(0, 15)
             r.waveRise = waveRise.getInt(500)
             r.waveHold = waveHold.getInt(100)
             r.waveFall = waveFall.getInt(500)
             r.waveOfft = waveOfft.getInt(1200)
+            r.waveSync = waveSync.isChecked
         }
 
         private fun clampTriple(t: Triple<Int, Int, Int>): Triple<Int, Int, Int> =

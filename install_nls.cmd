@@ -1,26 +1,28 @@
 @echo off
 rem ============================================================
-rem  install_nls.cmd - build the standalone NLS bridge APK and
-rem  drop it into the module packaging dir (module\nls.apk).
-rem  customize.sh installs nls.apk alongside led_gui.apk.
+rem  install_nls.cmd - build the standalone NLS bridge APK
+rem  (release, R8 minified, signed with the debug keystore) and
+rem  drop it into the module packaging dir
+rem  (module\notifybridge-release.apk). customize.sh installs
+rem  notifybridge-release.apk alongside led_gui-release.apk.
 rem
-rem  The bridge is a STANDALONE project now (projects\noty-bridge):
-rem  this script only consumes its artifact. Fix NLS below if
-rem  you keep the bridge repo elsewhere.
+rem  The bridge is a STANDALONE project now
+rem  (projects\android-notify-bridge): this script only consumes its
+rem  artifact. Fix NLS below if you keep the bridge repo elsewhere.
 rem ============================================================
 setlocal enabledelayedexpansion
-set "NLS=%~dp0..\noty-bridge"
-set "APK=%NLS%\app\build\outputs\apk\debug\app-debug.apk"
-set "DST=%~dp0module\nls.apk"
+set "NLS=%~dp0..\android-notify-bridge"
+set "APK=%NLS%\app\build\outputs\apk\release\notifybridge-release.apk"
+set "DST=%~dp0module\notifybridge-release.apk"
 
 if not exist "%APK%" (
     echo APK not built - building with gradle...
     pushd "%NLS%"
     where gradle >nul 2>nul
     if errorlevel 1 (
-        call "D:\System\Apps\gradle-8.12\bin\gradle.bat" assembleDebug
+        call "D:\System\Apps\gradle-8.12\bin\gradle.bat" assembleRelease
     ) else (
-        call gradle assembleDebug
+        call gradle assembleRelease
     )
     set "RC=!ERRORLEVEL!"
     popd

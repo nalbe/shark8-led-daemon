@@ -8,19 +8,34 @@
  *   [sec]         mode=off|solid|breath|wave
  *   [sec.solid]   cur=r,g,b         0..15 per channel current
  *   [sec.breath]  repeat=0..15, cur_r/cur_g/cur_b,
- *                 rise/hold/fall/offt (ms, owned here)
+ *                 rise/hold/fall/offt (ms, owned here),
+ *                 sync=0|1: LCFG0.SYNC master-channel lock (see below)
  *   [sec.wave]    t0=r,g,b phase offset (ms), repeat=0..15,
- *                 rise/hold/fall/offt (ms, owned here)
+ *                 rise/hold/fall/offt (ms, owned here),
+ *                 sync=0|1: LCFG0.SYNC master-channel lock (see below)
+ *
+ * sync (breath/wave): the AW2033's per-channel pattern controllers
+ * free-run on their own T0..T4, and because the rise/fall period grows
+ * almost linearly with the PWM amplitude, channels at different PWM
+ * levels drift out of phase over time. Setting LCFG0.SYNC (master =
+ * channel 0, red) makes the chip slave channels 1/2 to the master:
+ * the PWM written to channel 0 becomes the common amplitude for all
+ * three, per-channel CUR still applies, and the phases stay locked.
+ * Trade-off: in sync mode the color is expressed through the per-channel
+ * cur ratio, not the rgb PWM (rgb green/blue are ignored). Default 0.
+ * The bit is managed explicitly on every paint (set in breath/wave to
+ * the config value, cleared on solid/off), so a stale master bit can
+ * never leak into a config that turned sync off.
  *
  * Timing (rise/hold/fall/offt) belongs to the chip section that
  * animates: [sec.breath] and [sec.wave] each carry their own keys.
  * No base-section timing, no fallback. The [led] section keeps only
- * chip/daemon globals: logging, trace_sysfs, watchdog_ms, imax.
+ * chip/daemon globals: logging, trace_sysfs, imax.
  *
  * No timer threads, no sysfs poking, no software animation - the
  * breathing, traveling-wave and solid modes all run inside the chip
- * itself via the aw2033 controller (libaw2033.a from the standalone
- * aw2033-driver repo, header aw2033-driver/aw2033.h). Every
+ * itself via the aw2033 controller (lib\libaw2033.a from the standalone
+ * aw2033-driver repo, vendored header lib\aw2033.h). Every
  * other module (core, charge, notify, ring) lights the LEDs ONLY
  * through the exported led_event() / leds_all_off() calls in chgd.h.
  *
@@ -33,7 +48,7 @@
 #include <string.h>
 #include <unistd.h>
 #include "chgd.h"
-#include "../aw2033-driver/aw2033.h"
+#include "../lib/aw2033.h"
 
 /* builtin timing for a chip section that omits its keys (the GUI always
  * writes them; this only covers hand-written minimal configs) */
@@ -104,12 +119,20 @@ static void led_solid_rgb(const char *sec, int r, int g, int b)
     LOGI("[led] %s solid rgb=%d,%d,%d cur=%d,%d,%d", sec, r, g, b,
          cur[0], cur[1], cur[2]);
     if (!c) return;
+    /* manual mode ignores the LCFG0.SYNC master bit, but a stale bit
+     * would leak into the next pattern arm (aw_breathe_ex preserves it),
+     * so always drop it on solid. */
+    aw_sync_mode(c, 0);
     aw_solid(c, r, g, b, cur[0], cur[1], cur[2]);
 }
 
 /* breathing RGB on the chip: synchronized pattern start. The timing
  * lives in the [sec.breath] chip section itself (rise/hold/fall/offt);
- * repeat/cur are knob passthrough from the same section. */
+ * repeat/cur are knob passthrough from the same section. [sec.breath]
+ * sync=1 turns on the chip's built-in master sync (LCFG0.SYNC): all
+ * channels dim on PWM channel 0 (master red), per-channel cur still
+ * applies. That pins the phases that otherwise drift apart because the
+ * rise/fall period grows with the PWM amplitude. */
 static void led_breathe_rgb(const char *sec, int r, int g, int b)
 {
     aw_chip *c = led_hw();
@@ -123,9 +146,13 @@ static void led_breathe_rgb(const char *sec, int r, int g, int b)
     int  cur0    = clampi(conf_get_int(ss, "cur_r", 15), 0, 15);
     int  cur1    = clampi(conf_get_int(ss, "cur_g", 15), 0, 15);
     int  cur2    = clampi(conf_get_int(ss, "cur_b", 15), 0, 15);
-    LOGI("[led] %s breathe rgb=%d,%d,%d t=%ld,%ld,%ld,%ldms cur=%d,%d,%d rep=%d",
-         sec, r, g, b, rise, hold, fall, offt, cur0, cur1, cur2, repeat);
+    int  sync    = clampi(conf_get_int(ss, "sync", 0), 0, 1);
+    LOGI("[led] %s breathe rgb=%d,%d,%d t=%ld,%ld,%ld,%ldms cur=%d,%d,%d rep=%d sync=%d",
+         sec, r, g, b, rise, hold, fall, offt, cur0, cur1, cur2, repeat, sync);
     if (!c) return;
+    /* LCFG0.SYNC must be in place before the pattern arms (the chip
+     * latches the master-channel mode at pattern start). */
+    aw_sync_mode(c, sync);
     aw_breathe(c, r, g, b, rise, hold, fall, offt, 0, repeat, 1,
                cur0, cur1, cur2);
 }
@@ -159,16 +186,18 @@ static void led_wave_rgb(const char *sec, int r, int g, int b)
     int cur0 = clampi(conf_get_int(ss, "cur_r", 15), 0, 15);
     int cur1 = clampi(conf_get_int(ss, "cur_g", 15), 0, 15);
     int cur2 = clampi(conf_get_int(ss, "cur_b", 15), 0, 15);
+    int sync  = clampi(conf_get_int(ss, "sync", 0), 0, 1);
     /* allow a plain cur=r,g,b triple too (GUI writes none for wave, but
      * hand-written configs may use the same key as solid) */
     int curc[3] = { cur0, cur1, cur2 };
     if (read_triple(ss, "cur", curc, cur0, cur1, cur2, 0, 15))
         { cur0 = curc[0]; cur1 = curc[1]; cur2 = curc[2]; }
-    LOGI("[led] %s wave rgb=%d,%d,%d t=%ld/%ld/%ld/%ld t0=%ld,%ld,%ld rep=%d cur=%d,%d,%d",
+    LOGI("[led] %s wave rgb=%d,%d,%d t=%ld/%ld/%ld/%ld t0=%ld,%ld,%ld rep=%d cur=%d,%d,%d sync=%d",
          sec, r, g, b, rt[0], ht[0], ft[0], ot[0], z[0], z[1], z[2], repeat,
-         cur0, cur1, cur2);
+         cur0, cur1, cur2, sync);
     if (!c) return;
     int cur[3] = { cur0, cur1, cur2 };
+    aw_sync_mode(c, sync);
     aw_breathe_ex(c, r, g, b, rt, ht, ft, ot, z, repeat, 1, cur);
 }
 
@@ -176,8 +205,10 @@ void leds_all_off(void)
 {
     aw_chip *c = led_hw();
     LOGI("[led] all off");
-    if (c)
+    if (c) {
+        aw_sync_mode(c, 0);
         aw_all_off(c);
+    }
 }
 
 /* per-event dispatch used by charge/notify/missed/alarm/ring/voip.

@@ -4,10 +4,103 @@ Changelog for **this** repo: the chgd daemon core (`led_hal_root/`) and the
 LED GUI (`led_gui/`). History that belongs to a standalone project is kept
 out of here:
 
-- the headless notification bridge (`com.bastet.lednls`) moved to the
-  **noty-bridge** repo (its changelog lives there)
+- the headless notification bridge (`com.bastet.notifybridge`) moved to the
+  **notify-bridge** repo (its changelog lives there)
 - the AW2033 chip controller and `awctl` live in the **aw2033-driver** repo
   (this repo ships only the prebuilt `libaw2033.a`)
+
+## Revision: charge band recheck while charging (2026-09-20)
+
+1. **The LED could park on the wrong charge band for a whole charging
+   session.** This kernel fires a POWER_SUPPLY uevent only on plug/unplug -
+   a capacity crossing mid-charge broadcasts nothing. So a phone plugged
+   at 64% painted `lower` red at plug time and never repainted when the
+   battery rolled through the 70% threshold into `middle`: the GUI (which
+   reads `led_status`) and the diode both stayed on the low band while the
+   charge walked up to mid. `eval_and_write()` runs only on uevent /
+   SIGALRM / boot, and none of those exists between two thresholds.
+2. **Fix: a `charge` mode owns the idle channel (`""`) while the charger
+   is live.** A single 60s time-recheck re-evaluates the band (two sysfs
+   reads) and repaints only on a real band/color/mode change - the
+   existing `g_applied_band` fingerprint keeps the LED from blipping on
+   every tick. The cadence is a `REGISTER_MODE` in charge.c, no core
+   changes:
+   - `eval_and_write()` now caches `g_charge_live` (status Charging/Full);
+   - `charge_owns("")` returns true only while charging/full **and** the
+     notification pool is empty (`queue_active()` / `queue_has_pending()`
+     defer to notify's own idle claim), so a parked or showing
+     notification never competes with the recheck, in any link order;
+   - `charge_refresh()` ends with `retune_timer()` so plug arms the
+     cadence from the uevent itself and unplug (status -> Discharging)
+     drops it back to a disarmed idle - the next tick self-corrects even
+     if an unplug event was missed.
+3. Documented the gap: README (intro, charge event, architecture) admits
+   the third bounded fallback. No new led.conf keys, no GUI changes.
+4. **Periodic timer cadences are now phase-stable (core.c retune_timer).**
+   A periodic policy (the charge recheck, the notify screen-off poll, the
+   watchdog) that was already running at the same period is left alone:
+   previously every unrelated retune (SCREEN toggle, NLS connect/cancel,
+   power_supply uevent) restarted the countdown from zero, shifting the
+   tick grid. On the charge recheck that made the band switch look
+   coupled to whatever event retuned last - in the field it appeared as
+   "the diode changed right when the screen went off", though the repaint
+   itself always came out of the 60s tick. One-shot deadlines (cap
+   expiry, adaptive wakes) still re-arm from zero by design - a full
+   window from the event is their point.
+
+## Release: v3.2 - supervision and the WD push removed (2026-09-19)
+
+1. **The daemon no longer pushes `WD <ms>`.** `nls_push_watchdog()`, its
+   two call sites (client connect, config reload) and the `WD <ms>`
+   protocol line are gone from core.c. The `notifybridge.status` mirror
+   drops the `watchdog_ms=` field (util.c `nls_status_write`).
+2. **`[led] watchdog_ms` is removed** from led.conf and every config-side
+   comment (config.c/led.c). Nothing reads the key anymore.
+3. **Docs no longer claim any supervision.** module/README.txt,
+   module/module.prop and module/service.sh now state plainly that the
+NotifyBridge app is a pure transport: it restarts nothing, and if chgd
+    dies it stays down until reboot or a manual `service.sh` start. The
+    bridge-side watchdog was already removed when NotifyBridge was
+    repackaged (app v2.0.0, see the android-notify-bridge repo).
+4. **Module APKs now ship as `*-release.apk`.** The debug APKs
+    (led_gui 54 MB, notifybridge 2.4 MB) are gone from `module/`; the
+    module carries the R8-minified release builds instead (led_gui
+    ~0.45 MB, notifybridge ~0.06 MB), each signed up-front with the
+   debug keystore (`signingConfig = debug` in the two app gradle
+   files, `apksigner` no longer needed) so `pm install -r` works
+   from customize.sh and adb alike. `install_gui.cmd` /
+   `install_nls.cmd` build `assembleRelease` and stage the new names;
+   `customize.sh` installs them (bridge + GUI). The bridge repo path
+   is fixed to `projects\android-notify-bridge`. Module zip drops
+   from ~57 MB to ~1 MB; only the binary `chgd` keeps it
+   non-trivial.
+
+## Release: v3.1 - test_sec removed, test ring held until Disarm (2026-09-19)
+
+1. **`[ring] test_sec` removed.** The test-rainbow hold timer is gone from
+   led.conf and the GUI (Call tab). A test ring behaves like every other
+   test hook: it holds until Disarm, bounded only by the `[ring] max_sec`
+   safety cap when one is set.
+
+## Release: v3.0 - debug-named APK pair (2026-09-19)
+
+1. **Module APK artifacts renamed to their Gradle debug output names.**
+   The module no longer keeps hand-renamed copies: it consumes the
+   standalone projects' build outputs as-is.
+- NotifyBridge: `nls.apk` -> `notifybridge-debug.apk` (from the
+      `android-notify-bridge` repo, `archivesName = notifybridge`)
+   - LED GUI: `led_gui.apk` -> `led_gui-debug.apk` (from `led_gui/`,
+     `archivesName = led_gui`)
+   `customize.sh`, `.gitignore`, `build_module.cmd`,
+   `install_nls.cmd`/`install_gui.cmd` (build + stage + install) and the
+   docs all point at the new names. The stale `module/nls.apk` and
+   `module/led_gui.apk` are gone.
+2. **`install_nls.cmd` now finds the bridge repo.**
+   The standalone project moved to `projects\android-notify-bridge`; the
+   script's `NLS` path and consumed artifact name follow.
+3. **GUI: the Info tab's bridge button reads `Config`** - a stray leading
+   slash (`/Config`) was removed.
+4. Module bumped to v3.0 / code 20.
 
 ## Release: v2.17 - event-driven screen detection, the last 1s poll is gone (2026-09-19)
 
@@ -36,8 +129,8 @@ out of here:
    already used for the log toggle); the daemon reloads and pushes
    **`WD <ms>`** over the socket on every reload *and* every connect, and
    mirrors the value into its world-readable status file for the app's
-   one-time start. The NLS app's own 10s config poll is gone (that side
-   moved to the noty-bridge repo).
+one-time start. The NotifyBridge app's own 10s config poll is gone (that side
+    moved to the notify-bridge repo).
 5. **The daemon now watches its own config with inotify - zero stat()
    left in the lookup path.** `conf_watch_init()` opens an `IN_NONBLOCK`
    inotify fd and watches `CONF_DIR` (the directory, not the file, so
@@ -144,13 +237,13 @@ a second archive on every release.
 
 ## Release: v2.14 - bridge split out of the GUI, notification-driven calls (2026-09-16)
 
-1. **Notification bridge split out of the GUI: standalone headless NLS app
-   (`com.bastet.lednls`).** The `NotificationListenerService` and the su
-   watchdog are no longer built into the GUI APK - they live in the
-   standalone noty-bridge project now. The GUI's
-   `LedNotificationListenerService.kt` is deleted and no listener service
-   remains in the GUI manifest; the GUI (`com.bastet.ledgui`) is a pure
-   configurator. A bare daemon + NLS gives the full notification stack.
+1. **Notification bridge split out of the GUI: standalone headless NotifyBridge app
+    (`com.bastet.notifybridge`).** The `NotificationListenerService` and the su
+    watchdog are no longer built into the GUI APK - they live in the
+    standalone notify-bridge project now. The GUI's
+    `LedNotificationListenerService.kt` is deleted and no listener service
+    remains in the GUI manifest; the GUI (`com.bastet.ledgui`) is a pure
+    configurator. A bare daemon + NotifyBridge gives the full notification stack.
    `customize.sh` installs/refreshes both APKs on every module install;
    `install_nls.cmd` only consumes the standalone project's `nls.apk`.
 2. **VoIP detection is notification-driven (no polling).** voip.c no
@@ -163,7 +256,7 @@ a second archive on every release.
    buffer's `input_focus` records fed a `g_incall` call-window tracker
    ("Focus leaving ... InCallActivity" with `reason=NO_WINDOW` ends the
    rainbow with zero polling). SUPERSEDED: the event-log/`input_focus`
-   stream and the `g_incall` tracker were removed outright once the NLS
+   stream and the `g_incall` tracker were removed outright once NotifyBridge
    bridge became the only transport - the daemon reads no logdr/event-log
    at all now and call end is resolved from `RING_OFF` alone (see
    mods/ring.c, which carries no focus/logcat code).
@@ -179,7 +272,7 @@ a second archive on every release.
    stays as the GUI's direct fallback. customize.sh forces the toggle ON
    on a fresh install. The GUI's old in-app toggle checkbox was removed -
    the system setting page is the one control.
-5. **`/data/local/tmp/lednls.status` is written by the daemon, not the
+5. **`/data/local/tmp/notifybridge.status` is written by the daemon, not the
    app.** chgd writes `connected=1` on NLS accept, `connected=0` on
    client EOF and at startup with no client (util.c `nls_status_write`,
    atomic tmp+rename). The app-side write needed su at the exact
@@ -196,8 +289,8 @@ a second archive on every release.
    hint, and the status poll will not clear it - it turns green the
    moment root lands.
 7. Module bumped to v2.14 / code 16. led.conf stays canonical (always
-   overwritten). The status card's bridge line now reads `lednls.status`
-   and checks `com.bastet.lednls` for the granted listener.
+overwritten). The status card's bridge line now reads `notifybridge.status`
+    and checks `com.bastet.notifybridge` for the granted listener.
 
 ## Release: v2.13 - canonical config + GUI in the module zip (2026-09-15)
 
@@ -230,7 +323,7 @@ a second archive on every release.
    `lower/middle/upper_soft_breath` (the `_range_`-prefixed variants
    were dead since v2.11; charge.c always read the short names).
 7. Installer no longer ships keepalive.sh (the daemon is supervised by
-   the NLS app now); the runtime cleanup re-removes stale per-file `.c`
+   the NotyBridge app now); the runtime cleanup re-removes stale per-file `.c`
    copies from old releases.
 
 ## Revision: ID-based notification tracking + pseudo-package cancel bridge (2026-09-10)
@@ -292,7 +385,7 @@ but missing from this changelog).
    the hardcoded `RING_MAX_SEC` (120s) with `[ring] max_sec` (default 0 =
    unlimited). A capped incoming ring resolves into the missed-call check
    instead of silently killing the LED, so a missed row landing at the cap
-   is still caught. `[ring] test_sec` (test-rainbow hold) unchanged.
+   is still caught.
 4. **LED GUI grew to six tabs**: Info / Charge / Notification / Call / VoIP
    / Alarm with horizontally scrollable tab strip (tabs no longer crush on
    narrow widths). Call gained the missed-call editor and the ring blink
@@ -343,9 +436,10 @@ Planned layout applied. The daemon is now split as:
   [section] key=value in led.conf is readable via conf_get_str /
   conf_get_int, so a mod owns its own config section without config.c
   knowing the key exists. Example section:
-      [ring]
-      test_sec=30        # test-rainbow hold in seconds
-  Verified live: test_sec=5 -> WINCH-test rainbows die after exactly 5s.
+[ring]
+       max_sec=300        # live-ring safety cap in seconds, 0 = unlimited
+   Test rainbows carry no hold timer of their own: they run until Disarm
+   or the configured [ring] max_sec cap.
 - Rainbow cycler moved from ring.c into led.c (led_rainbow_reset/step/
   rgb); ring.c only starts/stops it. No LED code outside led.c anymore.
 - build.cmd tracks the new file list (chgd.c and mods/conf.c removed;

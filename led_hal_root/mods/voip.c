@@ -3,7 +3,7 @@
  *
  * Lights the traveling-wave rainbow while a messenger (Telegram /
  * WhatsApp / Viber / Signal) is in a call. The call detection lives in
- * the NLS bridge app (com.bastet.lednls), which inspects every
+ * the NotifyBridge app (com.bastet.notifybridge), which inspects every
  * notification as it posts and removes it: an incoming/active messenger
  * call is a notification on the messenger's call channel (Telegram:
  * "incoming_calls40", category CALL, audio usage VOICE_COMMUNICATION),
@@ -14,7 +14,7 @@
  * led_wave_rgb) - voip.c only arms it and lets the mode machinery
  * monitor for a missed VOIP_OFF; there is no per-tick color stepping.
  *
- * Transport (chgd_noty socket), sent by NLS:
+ * Transport (notify_bus socket), sent by NLS:
  *   VOIP_ON <pkg>     call notification posted    -> arm the rainbow
  *   VOIP_OFF <pkg>    call notification removed   -> disarm, channel back
  * The mode machinery only owns the LED while the mode is armed.
@@ -75,12 +75,14 @@ static int is_messenger(const char *pkg)
 }
 
 /* safety cap for a rainbow that missed its VOIP_OFF, seconds; [voip]
- * max_sec in led.conf, default VOIP_MAX_SEC. */
+ * max_sec in led.conf, default VOIP_MAX_SEC. 0 = never auto-disarm
+ * (0 must mean unlimited here too - the old fallback silently turned it
+ * back into VOIP_MAX_SEC, so "inf" was not configurable). */
 
 static long voip_max_sec(void)
 {
     long v = conf_get_int("voip", "max_sec", VOIP_MAX_SEC);
-    return v > 0 ? v : VOIP_MAX_SEC;
+    return v > 0 ? v : 0;
 }
 
 static void voip_rgb(int *r, int *g, int *b)
@@ -143,6 +145,19 @@ static void voip_tick(void)
         disarm_notification(&g_st, "voip safety cap");
 }
 
+/* adaptive wakeup: sleep exactly until the [voip] max_sec cap; cap=0
+ * means unlimited (never auto-disarm) and the end is purely event-driven
+ * (VOIP_OFF), so no timer at all - the core sleeps with the rainbow held */
+static long voip_next_wake(void)
+{
+    long cap = voip_max_sec();
+    if (cap <= 0) return 0;
+    double age = difftime(time(NULL), g_st.armed_at);
+    long remain = (long)(cap - age);
+    if (remain < 1) remain = 1;
+    return remain * 1000L;
+}
+
 /* Called by notify's default handler before it colors a package.
  * Returns 1 if voip owns the led (mid-call: never let a chat recolor the
  * rainbow), 0 for a normal chat message. Call START/END themselves are
@@ -154,4 +169,4 @@ int voip_try(const char *pkg)
     return 0;                              /* chat message -> normal color */
 }
 
-REGISTER_MODE("voip", 1000, voip_owns, voip_tick);
+REGISTER_MODE_WAKE("voip", 1000, voip_owns, voip_tick, voip_next_wake);

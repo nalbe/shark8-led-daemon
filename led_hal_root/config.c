@@ -16,7 +16,7 @@
  *   [notify]    SHARED behavior for every app:
  *               notif_max_sec (0 = unlimited), default_color r,g,b for
  *               apps without a [rules] entry (per-app color = [rules])
- *   [ring]      incoming-call rainbow: test_sec / max_sec + v3 color
+ *   [ring]      incoming-call rainbow: max_sec + v3 color
  *   [voip]      messenger-call rainbow: max_sec / packages + v3 color
  *
  * v3 per-event renderer sections (owned by led.c through the generic kv
@@ -27,7 +27,7 @@
  *                  by the chip section itself)
  *   [sec.wave]     t0=r,g,b phase offsets, repeat + rise/hold/fall/offt
  *   [led]          chip/daemon globals only: logging, trace_sysfs,
- *                  watchdog_ms, imax
+ *                  imax
  *
  * Every other key=value pair anywhere in the file lands in a generic
  * key-value table (conf_get_str / conf_get_int). That is how mods own
@@ -140,14 +140,21 @@ static int parse_rgb(const char *val, int *r, int *g, int *b)
 
 /* ---------------- registry seeding ---------------- */
 
-/* seed the rule table from the link-time registry. Only internal
- * pseudo-packages reside there (dialer's "missed.call"); real app
- * colors come from led.conf [rules] and win over these. */
+/* terminator keeps the link-time chgd_rules section non-empty so
+ * __start/__stop stay defined even with zero built-in rules; consumers
+ * stop at .pkg == NULL. No hidden rule is defined at build time - every
+ * real color must come from led.conf [rules]. */
+static const struct led_rule chgd_rules_terminator
+    __attribute__((used, section("chgd_rules"))) = { NULL, 0, 0, 0 };
+
+/* seed the rule table from the link-time registry (extension point for
+ * future built-ins, currently only the terminator). Real app colors come
+ * from led.conf [rules] and win over any built-in. */
 static void seed_rules(void)
 {
     const struct led_rule *r;
     int rr = 0, gg = 0, bb = 0;
-    for (r = __start_chgd_rules; r < __stop_chgd_rules; r++) {
+    for (r = __start_chgd_rules; r->pkg; r++) {
         if (g_nrules >= MAX_RULES) break;
         if (rule_rgb(r->pkg, &rr, &gg, &bb) == 0) {
             snprintf(g_rules[g_nrules].pkg, sizeof(g_rules[0].pkg), "%s", r->pkg);

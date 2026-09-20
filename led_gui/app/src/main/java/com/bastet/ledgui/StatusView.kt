@@ -55,14 +55,11 @@ class StatusView(context: Context) : LinearLayout(context) {
     private var imax = 0
     private var loggingOn = true
     private var loggingBusy = false
-    private var watchdogMs = 0L
-    private var watchdogBusy = false
     private var bridgeConnected = false
     private var rootRequestPending = false
     private var rootDialogPending = false
     private var suUnreachable = false
     private lateinit var loggingListener: android.widget.CompoundButton.OnCheckedChangeListener
-    private lateinit var watchdogEt: android.widget.EditText
 
     // widgets
     private lateinit var rootTv: TextView
@@ -152,11 +149,6 @@ private fun startTicker() {
             loggingCb.setOnCheckedChangeListener(null)
             loggingCb.isChecked = s.logging
             loggingCb.setOnCheckedChangeListener(loggingListener)
-        }
-        if (!watchdogBusy && watchdogMs != s.watchdogMs) {
-            watchdogMs = s.watchdogMs
-            watchdogEt.setText(if (s.watchdogMs > 0) s.watchdogMs.toString() else "")
-            watchdogEt.hint = if (s.watchdogMs > 0) "" else "off (0)"
         }
         if (bridgeConnected != s.bridgeConnected) {
             bridgeConnected = s.bridgeConnected
@@ -275,7 +267,7 @@ requestBtn.isEnabled = rootState != RootState.GRANTED
     private fun nlsEnabled(): Boolean {
         return try {
             val enabled = NotificationManagerCompat.getEnabledListenerPackages(context)
-            enabled.any { it.startsWith("com.bastet.lednls") }
+            enabled.any { it.startsWith("com.bastet.notifybridge") }
         } catch (_: Exception) {
             false
         }
@@ -288,6 +280,79 @@ requestBtn.isEnabled = rootState != RootState.GRANTED
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             )
         } catch (_: Exception) {
+        }
+    }
+
+    /** Ask the bridge to reload its config (com.bastet.notifybridge.RELOAD_CONFIG
+     *  broadcast), then re-read the live status line so the UI stays in sync. */
+    private fun refreshBridge() {
+        scope.launch {
+            val status = withContext(Dispatchers.IO) {
+                Su.run(
+                    "am broadcast -a com.bastet.notifybridge.RELOAD_CONFIG; " +
+                        "cat /data/local/tmp/notifybridge.status 2>/dev/null"
+                ).out
+            }
+            bridgeConnected = status.contains("connected=1")
+            renderBridge()
+        }
+    }
+
+    /** Copy the bridge config (notifybridge.json) into the app cache and hand
+     *  it to the default text viewer. The live file is under /data/local/tmp
+     *  and may be SELinux-unreadable to the app, so it is re-read via su; the
+     *  copy is what the viewer actually gets. */
+    private fun openBridgeConfig() {
+        scope.launch {
+            val content = withContext(Dispatchers.IO) {
+                Su.run("cat /data/local/tmp/notifybridge.json 2>/dev/null").out
+            }
+            val out = java.io.File(context.cacheDir, "logs/notifybridge.json")
+            out.parentFile?.mkdirs()
+            out.writeText(content.ifBlank { "(no config - built-in defaults in effect)" })
+            val uri = FileProvider.getUriForFile(
+                context, "com.bastet.ledgui.fileprovider", out
+            )
+            val ok = runCatching {
+                context.startActivity(
+                    Intent(Intent.ACTION_VIEW)
+                        .setDataAndType(uri, "text/plain")
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                )
+            }.isSuccess
+            if (!ok) {
+                android.widget.Toast.makeText(
+                    context, "no text viewer for the bridge config", android.widget.Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+    }
+
+    private fun openLedConf() {
+        scope.launch {
+            val content = withContext(Dispatchers.IO) {
+                Su.run("cat /data/adb/modules/led_hal_root/led.conf 2>/dev/null").out
+            }
+            val out = java.io.File(context.cacheDir, "logs/led.conf")
+            out.parentFile?.mkdirs()
+            out.writeText(content.ifBlank { "(led.conf not readable - module missing?)" })
+            val uri = FileProvider.getUriForFile(
+                context, "com.bastet.ledgui.fileprovider", out
+            )
+            val ok = runCatching {
+                context.startActivity(
+                    Intent(Intent.ACTION_VIEW)
+                        .setDataAndType(uri, "text/plain")
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                )
+            }.isSuccess
+            if (!ok) {
+                android.widget.Toast.makeText(
+                    context, "no text viewer for led.conf", android.widget.Toast.LENGTH_SHORT
+                ).show()
+            }
         }
     }
 
@@ -366,7 +431,14 @@ private fun updateLedLive() {
     }
 
     private fun sendHook(sig: String) {
-        scope.launch { withContext(Dispatchers.IO) { hook(sig) } }
+        scope.launch {
+            withContext(Dispatchers.IO) { hook(sig) }
+            // The daemon arms within a few ms; repoll right after so the
+            // LED state card shows the result instead of waiting for the
+            // 3s ticker (the light itself is already on).
+            delay(120)
+            refreshNow()
+        }
     }
 
     private fun clearLog() {
@@ -435,35 +507,7 @@ private fun updateLedLive() {
     }
 
 
-    /** Write a new [led] watchdog_ms into led.conf (single-key touch, like
-     *  toggleLogging), then SIGALRM the daemon so it reloads and pushes
-     *  "WD <ms>" over the socket - the NLS supervisor applies the fresh
-     *  value with zero polling. Empty = 0 = watchdog disabled. */
-    private fun applyWatchdog() {
-        if (watchdogBusy) return
-        watchdogBusy = true
-        val ms = watchdogEt.text.toString().trim().toLongOrNull()?.coerceIn(0, 86400000L) ?: 0L
-        scope.launch {
-            withContext(Dispatchers.IO) {
-                Su.run(
-                    "CFG=/data/adb/modules/led_hal_root/led.conf;" +
-                        " if grep -q '^watchdog_ms=.\$' \$CFG; then " +
-                        "  sed -i 's/^watchdog_ms=.*/watchdog_ms=$ms/' \$CFG; " +
-                        "else " +
-                        "  (printf '\\n[led]\\nwatchdog_ms=$ms\\n' >> \$CFG); " +
-                        "fi; kill -ALRM \$(pidof chgd) 2>/dev/null"
-                )
-            }
-            withContext(Dispatchers.Main) {
-                watchdogMs = ms
-                watchdogEt.setText(if (ms > 0) ms.toString() else "")
-                watchdogEt.hint = if (ms > 0) "" else "off (0)"
-                watchdogBusy = false
-            }
-        }
-    }
-
-private fun requestRoot() {
+    private fun requestRoot() {
         if (rootRequestPending) return
         rootRequestPending = true
         // No instant PENDING paint here: on this firmware a hidden su answers
@@ -531,59 +575,41 @@ private fun buildUi() {
             addView(spacer(8))
             addView(row(
                 filledBtn("Refresh") { refreshNow() },
-                outlinedBtn("Kill chgd") {
+                outlinedBtn("Restart") {
                     scope.launch {
                         val snap = withContext(Dispatchers.IO) {
-                            Su.run("kill -9 \$(pidof chgd) 2>/dev/null")
+                            Su.run(
+                                "kill -9 \$(pidof chgd) 2>/dev/null; " +
+                                    "setsid /data/adb/modules/led_hal_root/chgd " +
+                                    ">/data/local/tmp/chgd.err 2>&1 &"
+                            )
+                            runCatching { Thread.sleep(1000) }
                             collectAll()
                         }
                         applySnap(snap)
                     }
-                }
+                },
+                outlinedBtn("Config") { openLedConf() }
             ))
                 addView(spacer(4))
             addView(text(
-                "chgd is supervised by the NLS watchdog in this app. " +
-                    "Set 0 to disable the poll entirely (it only guards against crashes).",
+                "Refresh repolls; Restart force-ends chgd and relaunches it; " +
+                    "Config opens the live led.conf in a text viewer.",
                 13f, parse("#FF909090")
-            ))
-            addView(spacer(6))
-            addView(text("Watchdog poll interval (ms)", 13f, parse("#FFB0BEC5")))
-            watchdogEt = android.widget.EditText(context)
-            watchdogEt.inputType = android.text.InputType.TYPE_CLASS_NUMBER
-            watchdogEt.setSingleLine(true)
-            watchdogEt.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-            watchdogEt.setTextColor(parse("#FFE0E0E0"))
-            watchdogEt.hint = "60000"
-            val wg = GradientDrawable()
-            wg.shape = GradientDrawable.RECTANGLE
-            wg.cornerRadius = dpf(8)
-            wg.setColor(parse("#FF2A2A2A"))
-            wg.setStroke(dpi(1), parse("#FF333333"))
-            watchdogEt.background = wg
-            watchdogEt.setPadding(dpi(8), dpi(6), dpi(8), dpi(6))
-            watchdogEt.layoutParams = LayoutParams(0, wP, 1f)
-            addView(row(
-                watchdogEt,
-                filledBtn("Apply") { applyWatchdog() }
-            ))
-            addView(spacer(2))
-            addView(text(
-                "0 = disabled. Changes apply live (no daemon restart).",
-                12f, parse("#FF727272")
             ))
         })
 
         // --- Notification bridge card
         content.addView(card {
-            addView(sectionTitle("Notification bridge (NLS)"))
+            addView(sectionTitle("Notification bridge"))
             addView(spacer(6))
             bridgeTv = text("checking...", 13f, parse("#FFB0BEC5"))
             addView(bridgeTv)
             addView(spacer(4))
             addView(row(
                 filledBtn("Notification access") { openNlsSettings() },
-                outlinedBtn("Refresh") { renderBridge() }
+                outlinedBtn("Config") { openBridgeConfig() },
+                outlinedBtn("Refresh") { refreshBridge() }
             ))
             addView(spacer(4))
             addView(text(
@@ -635,16 +661,17 @@ ledModeTv = text("")
             addView(sectionTitle("Test hooks"))
             addView(spacer(6))
             addView(row(
-                filledBtn("Fake Telegram") { sendHook("USR1") },
-                outlinedBtn("Disarm") { sendHook("USR2") }
+                filledBtn("notify") { sendHook("USR1") },
+                filledBtn("call") { sendHook("HUP") },
+                filledBtn("voip") { sendHook("WINCH") }
             ))
             addView(spacer(4))
             addView(row(
-                filledBtn("Fake Dialer") { sendHook("HUP") },
-                outlinedBtn("Rainbow") { sendHook("WINCH") }
+                filledBtn("alarm") { sendHook("TSTP") },
+                filledBtn("charge") { sendHook("QUIT") }
             ))
             addView(spacer(4))
-            addView(row(filledBtn("Charge Test") { sendHook("QUIT") }))
+            addView(row(outlinedBtn("Disarm") { sendHook("USR2") }))
         })
 
         // --- log card
@@ -775,7 +802,6 @@ private fun daemonPid(): String = Su.run("pidof chgd 2>/dev/null").out
         val conf: LedConf?,
         val log: String,
         val logging: Boolean,
-        val watchdogMs: Long,
         val bridgeConnected: Boolean,
         val imax: Int
     )
@@ -788,9 +814,8 @@ private fun daemonPid(): String = Su.run("pidof chgd 2>/dev/null").out
                 " echo 'L<<'; tail -n 25 /data/local/tmp/ledd.log 2>/dev/null; echo 'L>>';" +
                 " echo 'C<<'; cat /data/adb/modules/led_hal_root/led.conf 2>/dev/null; echo 'C>>';" +
                 " echo 'G='\$(grep -o '^logging=[01]' /data/adb/modules/led_hal_root/led.conf 2>/dev/null | head -1);" +
-                " echo 'W='\$(grep -o '^watchdog_ms=[0-9]*' /data/adb/modules/led_hal_root/led.conf 2>/dev/null | head -1);" +
                 " echo 'I='\$(grep -o '^imax=[0-9]*' /data/adb/modules/led_hal_root/led.conf 2>/dev/null | head -1);" +
-                " echo 'N='\$(cat /data/local/tmp/lednls.status 2>/dev/null)"
+                " echo 'N='\$(cat /data/local/tmp/notifybridge.status 2>/dev/null)"
         ).out
 
         var rootOk = false
@@ -799,7 +824,6 @@ private fun daemonPid(): String = Su.run("pidof chgd 2>/dev/null").out
         var conf: LedConf? = null
         var log = ""
         var logging = true
-        var watchdogMs = 0L
         var bridgeConnected = false
         var imax = 0
         var section = ""
@@ -810,7 +834,6 @@ private fun daemonPid(): String = Su.run("pidof chgd 2>/dev/null").out
                 line.startsWith("D=") -> daemon = line.substring(2)
                 line.startsWith("G=logging=0") -> logging = false
                 line.startsWith("G=logging=1") -> logging = true
-                line.startsWith("W=watchdog_ms=") -> watchdogMs = line.substringAfter("=").toLongOrNull() ?: 0L
                 line.startsWith("I=imax=") -> imax = line.substringAfter("=").toIntOrNull() ?: 0
                 line.startsWith("N=connected=1") -> bridgeConnected = true
                 line.startsWith("N=connected=0") -> bridgeConnected = false
@@ -828,7 +851,7 @@ private fun daemonPid(): String = Su.run("pidof chgd 2>/dev/null").out
                 section == "C" -> sb.appendLine(line)
             }
         }
-        val snap = Snapshot(rootOk, daemon, status, conf, log, logging, watchdogMs, bridgeConnected, imax)
+        val snap = Snapshot(rootOk, daemon, status, conf, log, logging, bridgeConnected, imax)
         // The poll already fetched led.conf - hand it to the shared settings
         // cache so config tabs first paint instantly (no per-tab su roundtrip).
         if (rootOk && conf != null) LedConf.updateCache(conf)

@@ -4,12 +4,12 @@
  * Entered on a RING_ON command from the NLS bridge (it classifies the
  * dialer's live-call notification) and exited on RING_OFF, which resolves
  * the outcome: incoming -> missed-call verification window, outgoing ->
- * plain charge leds. Registers a timer MODE: while the pseudo-package is
- * armed, the core drops the timer to our heartbeat (RING_STEP_MS) and
- * calls ring_tick() on every tick. Ring mode deliberately ignores the
- * screen state (this ROM wakes the display for incoming calls and the
- * screen-on guard would kill the effect); it exits on RING_OFF, timeout,
- * or explicit disarm.
+ * plain charge leds. Registers an adaptive timer MODE: while the
+ * pseudo-package is armed, the core sleeps exactly until the [ring]
+ * max_sec cap (disarmed when 0 = unlimited) and calls ring_tick() there.
+ * Ring mode deliberately ignores the screen state (this ROM wakes the
+ * display for incoming calls and the screen-on guard would kill the
+ * effect); it exits on RING_OFF, timeout, or explicit disarm.
  *
  * The rainbow itself runs on the AW2033 chip (traveling-wave mode via
  * led_wave_rgb): ring.c only arms it and resolves the outcome on end.
@@ -17,10 +17,10 @@
  * bridge - there is no telephony/dumpsys polling and no logdr focus
  * tracking anymore.
  *
- * Config: [ring] test_sec=<n> overrides the test-rainbow hold (default
- * RING_TEST_SEC), max_sec=<n> caps a live ring rainbow (default 0 =
- * unlimited; a capped incoming ring resolves into the missed-call
- * check). Looked up through config.c's generic kv store.
+ * Config: [ring] max_sec=<n> caps a ring rainbow (default 0 = unlimited;
+ * a capped incoming ring resolves into the missed-call check). A test
+ * rainbow holds until Disarm or the cap. Looked up through config.c's
+ * generic kv store.
  *
  * The mode pattern is the extension seam for any LED "behavior" that is
  * driven by the timer rather than by a single arm/disarm:
@@ -34,20 +34,12 @@
 
 #define INCOMING_PKG   "incoming.call"   /* pseudo-pkg: ring rainbow */
 #define RING_STEP_MS   1000      /* tick: cap checks only (chip animates) */
-#define RING_TEST_SEC  30        /* default test-rainbow hold ([ring] test_sec) */
 
-/* test-rainbow hold, seconds; overridable via [ring] test_sec in led.conf */
-static long ring_test_hold(void)
-{
-    long v = conf_get_int("ring", "test_sec", RING_TEST_SEC);
-    return v > 0 ? v : RING_TEST_SEC;
-}
-
-/* hard cap for a LIVE ring rainbow, seconds; [ring] max_sec in led.conf.
+/* hard cap for a ring rainbow, seconds; [ring] max_sec in led.conf.
  * 0 (default) = unlimited: the rainbow runs for the whole telephony
- * call. A cap only bounds a pathological stuck state, and unlike the
- * old RING_MAX_SEC path it resolves the outcome instead of silently
- * killing the LED. */
+ * call (a test rainbow then holds until Disarm). A cap only bounds a
+ * pathological stuck state, and unlike the old RING_MAX_SEC path it
+ * resolves the outcome instead of silently killing the LED. */
 static long ring_max_sec(void)
 {
     long v = conf_get_int("ring", "max_sec", 0);
@@ -73,7 +65,7 @@ static void ring_rgb(int *r, int *g, int *b)
  * call check, outgoing just drops back to the charge leds. */
 static int g_ring_incoming;
 /* 1 when armed from a test hook: no live call semantics, the rainbow is
- * held for RING_TEST_SEC, or until Disarm / USR2. */
+ * held until Disarm / USR2 (or the [ring] max_sec cap). */
 static int g_ring_test;
 
 int ring_is_active(void)
@@ -162,21 +154,34 @@ static int ring_owns(const char *pkg)
 
 static void ring_tick(void)
 {
-    if (g_ring_test) {
-        double age = difftime(time(NULL), g_st.armed_at);
-        if (age >= (double)ring_test_hold())
-            disarm_notification(&g_st, "test timeout");
-        return;
-    }
-    /* [ring] max_sec: optional hard cap for the live rainbow.
-     * 0 = unlimited; when a cap IS set, hitting it resolves the outcome
-     * exactly like a RING_OFF, so a missed call landing right at the cap
-     * is still caught. The normal end of a live call is event-driven
-     * (RING_OFF from the NLS bridge), no polling here. */
+    /* [ring] max_sec: optional hard cap for the rainbow.
+     * 0 = unlimited; when a cap IS set, hitting it ends the rainbow.
+     * A live cap resolves the outcome exactly like a RING_OFF (a missed
+     * call landing right at the cap is still caught); a test rainbow is
+     * just disarmed - no missed-call side effects. The normal end of a
+     * live call is event-driven (RING_OFF from the NLS bridge), no
+     * polling here. */
     long cap = ring_max_sec();
     if (cap > 0 &&
-        difftime(time(NULL), g_st.armed_at) >= (double)cap)
-        ring_resolve("max_sec");
+        difftime(time(NULL), g_st.armed_at) >= (double)cap) {
+        if (g_ring_test)
+            disarm_notification(&g_st, "max_sec");
+        else
+            ring_resolve("max_sec");
+    }
 }
 
-REGISTER_MODE("ring", RING_STEP_MS, ring_owns, ring_tick);
+/* adaptive wakeup: sleep exactly until the [ring] max_sec cap; cap=0
+ * means unlimited and the end is purely event-driven (RING_OFF), so no
+ * timer at all - the core sleeps with the rainbow held */
+static long ring_next_wake(void)
+{
+    long cap = ring_max_sec();
+    if (cap <= 0) return 0;
+    double age = difftime(time(NULL), g_st.armed_at);
+    long remain = (long)(cap - age);
+    if (remain < 1) remain = 1;
+    return remain * 1000L;
+}
+
+REGISTER_MODE_WAKE("ring", RING_STEP_MS, ring_owns, ring_tick, ring_next_wake);

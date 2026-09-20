@@ -174,15 +174,14 @@ void light_pulse_invalidate(void)
  * file: it runs as root, so the write always succeeds and the value tracks
  * the actual accept/EOF events, not the NLS app's root luck. Atomic tmp +
  * rename, same pattern as led_status. */
-#define NLS_STATUS_PATH "/data/local/tmp/lednls.status"
-#define NLS_STATUS_TMP  "/data/local/tmp/lednls.status.tmp"
+#define NLS_STATUS_PATH "/data/local/tmp/notifybridge.status"
+#define NLS_STATUS_TMP  "/data/local/tmp/notifybridge.status.tmp"
 
 void nls_status_write(int connected)
 {
-    char buf[96];
-    int len = snprintf(buf, sizeof(buf), "connected=%d\nwatchdog_ms=%ld\n",
-                       connected ? 1 : 0,
-                       conf_get_int("led", "watchdog_ms", 60000));
+    char buf[48];
+    int len = snprintf(buf, sizeof(buf), "connected=%d\n",
+                       connected ? 1 : 0);
     int fd = open(NLS_STATUS_TMP, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) return;
     ssize_t ig = write(fd, buf, (size_t)len); (void)ig;

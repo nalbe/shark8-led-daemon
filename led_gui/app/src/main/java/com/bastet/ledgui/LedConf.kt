@@ -1,5 +1,7 @@
 package com.bastet.ledgui
 
+import java.util.Locale
+
 /**
  * led.conf model + text parser/renderer (v4 - per-event chip renderer).
  *
@@ -12,12 +14,13 @@ package com.bastet.ledgui
  * mode, color); the chip sections own their timing:
  *   [sec]           mode=off|solid|breath|wave (+ event common keys)
  *   [sec.solid]     cur=r,g,b          0..15 per-channel current
- *   [sec.breath]    repeat, cur_r/cur_g/cur_b, rise/hold/fall/offt
- *   [sec.wave]      t0=r,g,b phase offsets (ms), repeat, rise/hold/fall/offt
+ *   [sec.breath]    repeat, cur_r/cur_g/cur_b, rise/hold/fall/offt,
+ *                   sync=0|1 (LCFG0.SYNC master-channel lock)
+ *   [sec.wave]      t0=r,g,b phase offsets (ms), repeat, rise/hold/fall/offt,
+ *                   sync=0|1 (LCFG0.SYNC master-channel lock)
  * There is NO fallback anywhere: a chip section carries its own timing,
  * nothing is inherited from the base section.
- * [led] carries only daemon/chip globals: logging, trace_sysfs,
- * watchdog_ms, imax.
+ * [led] carries only daemon/chip globals: logging, trace_sysfs, imax.
  */
 data class Rule(val pkg: String, val r: Int, val g: Int, val b: Int)
 
@@ -33,12 +36,14 @@ data class Render(
     var brHold: Int = 100,
     var brFall: Int = 500,
     var brOfft: Int = 1200,
+    var brSync: Boolean = false,
     var waveT0: Triple<Int, Int, Int> = Triple(0, 1300, 2600),
     var waveRepeat: Int = 0,
     var waveRise: Int = 500,
     var waveHold: Int = 100,
     var waveFall: Int = 500,
-    var waveOfft: Int = 1200
+    var waveOfft: Int = 1200,
+    var waveSync: Boolean = false
 )
 
 /** charge bands breathe at 700/100/700/900, calls at 800/200/800/400 */
@@ -65,7 +70,6 @@ data class LedConf(
     var notifyColor: Triple<Int, Int, Int> = Triple(255, 150, 150),
     var notifAppMaxSec: Long = 0,
     var notifAppScreenDelayMs: Long = 60000,
-    var ringTestSec: Long = 30,
     var ringCapSec: Long = 0,
     var ringColor: Triple<Int, Int, Int> = Triple(255, 255, 255),
     var voipMaxSec: Long = 300,
@@ -73,7 +77,6 @@ data class LedConf(
     var voipColor: Triple<Int, Int, Int> = Triple(255, 255, 255),
     var logging: Boolean = true,
     var traceSysfs: Boolean = false,
-    var watchdogMs: Long = 60000,
     var imax: Int = 30,
     var chargeLower: Render = Render().chargeTiming(),
     var chargeMiddle: Render = Render().chargeTiming(),
@@ -87,7 +90,14 @@ data class LedConf(
     var alarmColor: Triple<Int, Int, Int> = Triple(255, 155, 0),
     var alarmMaxSec: Long = 0,
     var missedColor: Triple<Int, Int, Int> = Triple(255, 0, 0),
-    var missedMaxSec: Long = 0
+    var missedMaxSec: Long = 0,
+    /** [preview] calibration: apparent per-LED brightness vs green=100
+     *  and the perception-curve exponent. Only the GUI picture uses these
+     *  (the picker swatch + the Info live swatch); the daemon ignores them. */
+    var pvwR: Double = 50.0,
+    var pvwG: Double = 100.0,
+    var pvwB: Double = 80.0,
+    var pvwGamma: Double = 2.2
 ) {
 
     companion object {
@@ -149,6 +159,7 @@ data class LedConf(
                 "hold" -> v.toIntOrNull()?.let { r.brHold = it }
                 "fall" -> v.toIntOrNull()?.let { r.brFall = it }
                 "offt" -> v.toIntOrNull()?.let { r.brOfft = it }
+                "sync" -> v.toIntOrNull()?.let { r.brSync = it != 0 }
             }
             "wave" -> when (k) {
                 "t0" -> parseTriple(v)?.let { r.waveT0 = Triple(
@@ -159,6 +170,7 @@ data class LedConf(
                 "hold" -> v.toIntOrNull()?.let { r.waveHold = it }
                 "fall" -> v.toIntOrNull()?.let { r.waveFall = it }
                 "offt" -> v.toIntOrNull()?.let { r.waveOfft = it }
+                "sync" -> v.toIntOrNull()?.let { r.waveSync = it != 0 }
             }
         }
     }
@@ -239,7 +251,6 @@ data class LedConf(
                     val k = line.substring(0, i).trim()
                     val v = line.substring(i + 1).trim()
                     when (k) {
-                        "test_sec" -> v.toLongOrNull()?.let { ringTestSec = it }
                         "max_sec" -> v.toLongOrNull()?.let { ringCapSec = it }
                         "color" -> parseRgb(v)?.let { ringColor = it }
                         "mode" -> parseMode(v)?.let { ringRender.mode = it }
@@ -279,7 +290,7 @@ data class LedConf(
                         "mode" -> parseMode(v)?.let { alarmRender.mode = it }
                     }
                 }
-                "led" -> {
+"led" -> {
                     val i = line.indexOf('=')
                     if (i <= 0) continue
                     val k = line.substring(0, i).trim()
@@ -287,8 +298,21 @@ data class LedConf(
                     when (k) {
                         "logging" -> v.toIntOrNull()?.let { logging = it != 0 }
                         "trace_sysfs" -> v.toIntOrNull()?.let { traceSysfs = it != 0 }
-                        "watchdog_ms" -> v.toLongOrNull()?.let { watchdogMs = it }
-                        "imax" -> v.toIntOrNull()?.let { imax = it }
+                        "imax" -> v.toIntOrNull()?.let { imax = it.coerceIn(1, 40) }
+                    }
+                }
+                "preview" -> {
+                    val i = line.indexOf('=')
+                    if (i <= 0) continue
+                    val k = line.substring(0, i).trim()
+                    val v = line.substring(i + 1).trim().toDoubleOrNull()?.let {
+                        if (it > 0) it else null
+                    } ?: continue
+                    when (k) {
+                        "r" -> pvwR = v
+                        "g" -> pvwG = v
+                        "b" -> pvwB = v
+                        "gamma" -> pvwGamma = v.coerceIn(1.0, 4.0)
                     }
                 }
                 else -> {
@@ -309,6 +333,7 @@ data class LedConf(
         if (firstThreshold > secondThreshold) {
             val t = firstThreshold; firstThreshold = secondThreshold; secondThreshold = t
         }
+        LedSim.cal = LedSim.Cal(pvwR / 100.0, pvwG / 100.0, pvwB / 100.0, pvwGamma)
     }
 
     fun render(): String {
@@ -320,9 +345,9 @@ data class LedConf(
         sb.append("# [rules]    pkg=r,g,b  (0-255 per channel)\n")
         sb.append("# [charge]   thresholds ONLY; each band owns color/timing\n")
         sb.append("# [notify]   shared behavior: notif_max_sec, default color\n")
-        sb.append("# [ring]     incoming call rainbow: test_sec, max_sec, base color\n")
+        sb.append("# [ring]     incoming call rainbow: max_sec, base color\n")
         sb.append("# [voip]     messenger call rainbow: max_sec, packages, base color\n")
-        sb.append("# [led]      daemon log/watchdog + global chip Imax\n")
+        sb.append("# [led]      daemon logging + global chip Imax\n")
         sb.append("# [missed]   missed-call indication: color, max_sec\n")
         sb.append("# [alarm]    alarm clock indication: color, max_sec\n")
         sb.append("#\n")
@@ -354,7 +379,6 @@ data class LedConf(
         appendMode(sb, "notify.app", notifyAppRender)
         appendRenderChips(sb, "notify.app", notifyAppRender)
         sb.append("\n[ring]\n")
-        sb.append("test_sec=").append(ringTestSec).append('\n')
         sb.append("max_sec=").append(ringCapSec).append('\n')
         sb.append("color=").append(rgb(ringColor)).append('\n')
         appendMode(sb, "ring", ringRender)
@@ -366,8 +390,15 @@ data class LedConf(
         sb.append("\n[led]\n")
         sb.append("logging=").append(if (logging) 1 else 0).append('\n')
         sb.append("trace_sysfs=").append(if (traceSysfs) 1 else 0).append('\n')
-        sb.append("watchdog_ms=").append(watchdogMs).append('\n')
         sb.append("imax=").append(imax).append('\n')
+        sb.append("\n# GUI preview calibration (daemon ignores): how bright each\n")
+        sb.append("# LED looks vs the picker value. green=100 is the reference;\n")
+        sb.append("# gamma bends the curve toward your eye. Tune to your LED set.\n")
+        sb.append("[preview]\n")
+        sb.append("r=").append(fmtW(pvwR)).append('\n')
+        sb.append("g=").append(fmtW(pvwG)).append('\n')
+        sb.append("b=").append(fmtW(pvwB)).append('\n')
+        sb.append("gamma=").append(String.format(Locale.US, "%.1f", pvwGamma)).append('\n')
         appendRenderChips(sb, "notify", notifyRender)
         appendRenderChips(sb, "ring", ringRender)
         appendRenderChips(sb, "voip", voipRender)
@@ -402,6 +433,7 @@ data class LedConf(
         sb.append("\n[").append(sec).append(".solid]\n")
         sb.append("cur=").append(tripleClamp(r.solidCur, 0, 15)).append('\n')
         sb.append("\n[").append(sec).append(".breath]\n")
+        sb.append("sync=").append(if (r.brSync) 1 else 0).append('\n')
         sb.append("repeat=").append(r.brRepeat.coerceIn(0, 15)).append('\n')
         sb.append("cur_r=").append(r.brCur.first.coerceIn(0, 15)).append('\n')
         sb.append("cur_g=").append(r.brCur.second.coerceIn(0, 15)).append('\n')
@@ -411,6 +443,7 @@ data class LedConf(
         sb.append("fall=").append(r.brFall).append('\n')
         sb.append("offt=").append(r.brOfft).append('\n')
         sb.append("\n[").append(sec).append(".wave]\n")
+        sb.append("sync=").append(if (r.waveSync) 1 else 0).append('\n')
         sb.append("t0=").append(r.waveT0.first.coerceAtLeast(0)).append(',')
             .append(r.waveT0.second.coerceAtLeast(0)).append(',')
             .append(r.waveT0.third.coerceAtLeast(0)).append('\n')
@@ -425,6 +458,9 @@ data class LedConf(
 
     private fun rgb(c: Triple<Int, Int, Int>): String =
         "${clampColor(c.first)},${clampColor(c.second)},${clampColor(c.third)}"
+
+    private fun fmtW(w: Double): String =
+        String.format(Locale.US, "%.0f", w.coerceAtLeast(1.0))
 
     private fun tripleClamp(c: Triple<Int, Int, Int>, lo: Int, hi: Int): String =
         "${c.first.coerceIn(lo, hi)},${c.second.coerceIn(lo, hi)},${c.third.coerceIn(lo, hi)}"

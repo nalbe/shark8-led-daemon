@@ -102,6 +102,14 @@ static int alarm_handle(const char *pkg, int id)
     return 1;
 }
 
+/* Test hook (SIGTSTP from the GUI): paint the [alarm] renderer now,
+ * overriding any call rainbow that owns the channel. */
+int alarm_test(void)
+{
+    alarm_paint(ALARM_PKG_GOOGLE);
+    return 1;
+}
+
 /* adaptive wakeup: sleep until the [alarm] max_sec cap expires; cap=0
  * means permanent and disarm is purely event-driven (cancel) */
 static long alarm_next_wake(void)

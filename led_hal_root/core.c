@@ -7,7 +7,7 @@
  *   - netlink KOBJECT_UEVENT -> uev_dispatch(): every REGISTER_UEVENT
  *     hook whose match substring hits the raw message fires (charge
  *     owns "power_supply")
- *   - NLS socket "chgd_noty": the NotificationListenerService bridge
+ *   - NLS socket "notify_bus": the NotificationListenerService bridge
  *     is the ONLY notification transport (no logdr/logcat anymore).
  *     ENQ/CAN/CAN_ALL feed the same pkg_dispatch pipeline; VOIP_ON/OFF,
  *     RING_ON/OFF arm the call rainbows directly.
@@ -17,6 +17,9 @@
  *     while the pool still has work; at true idle (empty pool + empty
  *     cur_pkg) no mode owns anything and the timer is disarmed - the
  *     charge band repaints via power_supply uevent or SIGALRM.
+ *     A mode with no deadline (next_wake_ms()==0, i.e. max_sec=0) keeps
+ *     the timer DISARMED too: once its LED is up, nothing runs and the
+ *     phone sleeps until the next event (cancel, RING_OFF, VOIP_OFF).
  *     Dialer's missed-call verification window wins over idle while
  *     pending
  *   - signal test hooks and watchdog / lockfile housekeeping
@@ -47,7 +50,7 @@
 
 #define STATE_PATH "/data/local/tmp/led_chg"
 #define LOCK_PATH  "/data/local/tmp/led_chgd.lock"
-#define NLS_SOCK_NAME "chgd_noty"   /* abstract namespace: no fs entry */
+#define NLS_SOCK_NAME "notify_bus"   /* abstract namespace: no fs entry */
 
 int g_tfd = -1;
 /* NotificationListenerService client fd. It is the authoritative
@@ -145,7 +148,7 @@ void notif_cancel_all(const char *pkg)
 }
 
 /* ---------------- NLS socket transport ----------------
- * Abstract-namespace SOCK_STREAM server ("chgd_noty"). The standalone
+ * Abstract-namespace SOCK_STREAM server ("notify_bus"). The standalone
  * NLS app connects, sends one text command per line:
  *   ENQ <pkg> <id>      notification posted
  *   CAN <pkg> <id>      notification removed
@@ -165,12 +168,6 @@ void notif_cancel_all(const char *pkg)
  *                       this edge is what lets a parked notification
  *                       flash with zero polling; on connect the app
  *                       replays the current state.
- *   PING                liveness probe -> PONG
- *   WD <ms>             daemon -> client: current [led] watchdog_ms. Pushed
- *                       on connect AND after every GUI save (SIGALRM
- *                       reload). The daemon is the only legitimate reader
- *                       of led.conf (root-owned tree); this channel is why
- *                       the NLS supervisor has NO mtime poll.
  * Only one client at a time; a new connect replaces the old one. This is
  * the ONLY notification transport: there is no logdr/logcat fallback. On
  * connect the client replays its live state (RING/VOIP + every ENQ) so a
@@ -197,21 +194,6 @@ static int nls_listen(void)
     return fd;
 }
 
-/* Push the current [led] watchdog_ms to the NLS client. The GUI edits
- * the key and pokes us with SIGALRM (g_conf_reload); we are root, so we
- * are the only legitimate reader of led.conf - a non-root process cannot
- * even inotify it (/data/adb is 700 root, inotify_add_watch returns
- * EACCES without read on the file). Forwarding over the socket is what
- * lets the NLS supervisor drop its 10s mtime poll entirely. */
-static void nls_push_watchdog(void)
-{
-    if (g_nls < 0) return;
-    char buf[32];
-    int n = snprintf(buf, sizeof(buf), "WD %ld\n",
-                     conf_get_int("led", "watchdog_ms", 60000));
-    send(g_nls, buf, (size_t)n, MSG_NOSIGNAL);
-}
-
 static void nls_accept(void)
 {
     if (g_nls_l < 0) return;
@@ -226,17 +208,11 @@ static void nls_accept(void)
     g_nls_len = 0;
     LOGI("nls: client connected");
     nls_status_write(1);
-    nls_push_watchdog();        /* NLS needs the cadence upfront, no poll */
     retune_timer();             /* drop any pending backoff */
 }
 
 static void nls_cmd(const char *s)
 {
-    if (!strcmp(s, "PING")) {
-        if (g_nls >= 0)
-            send(g_nls, "PONG\n", 5, MSG_NOSIGNAL);
-        return;
-    }
     /* Call detection is event-driven from the NLS bridge: it classifies
      * the SIM/dialer notification and posts RING_ON on the live call
      * (incoming=1 / outgoing=0), RING_OFF when the last call notification
@@ -381,16 +357,16 @@ void retune_timer(void)
                     ms = w;              /* sleep exactly until the deadline */
                 } else {
                     /* 0 = no deadline at all (permanent LED, disarm is
-                     * purely event-driven). Do NOT fall back to the 1s
-                     * heartbeat - that is the bug that kept the device
-                     * waking every second while a no-cap notification,
-                     * alarm or missed-call LED just sat there. A single
-                     * WATCHDOG_SEC safety pass is enough: a lost cancel
-                     * can only leave the LED wrong for at most that. */
-                    ms = WATCHDOG_SEC*1000L;
+                     * purely event-driven): disarm the timer completely.
+                     * After the LED is armed there is nothing time-bound
+                     * left, so no wakeup at all and the phone sleeps. The
+                     * old fallback to WATCHDOG_SEC re-armed a one-shot on
+                     * every tick - an eternal wake every 5 minutes while a
+                     * no-cap LED idled, and its tick was a no-op anyway. */
+                    ms = 0;
                     why = "event-driven";
                 }
-                one_shot = 1;            /* re-armed after each tick */
+                if (ms > 0) one_shot = 1;    /* re-armed after each tick */
             } else {
                 ms = m->tick_ms;         /* plain periodic heartbeat */
             }
@@ -427,6 +403,18 @@ void retune_timer(void)
                 cur.it_value.tv_nsec / 1000000L;
         if (curms == ms && (cur.it_value.tv_sec || cur.it_value.tv_nsec))
             return;
+        /* a periodic policy already running at the SAME period keeps its
+         * phase: restarting the countdown from zero on every unrelated
+         * retune (screen toggle, NLS connect/cancel, uevent) shifts the
+         * tick grid, so a fixed cadence like the charge recheck looks
+         * coupled to whatever event retuned last. One-shots (cap expiry,
+         * adaptive deadlines) still re-arm from zero - a full window from
+         * the event is their whole point. */
+        if (!one_shot && ms > 0 &&
+            cur.it_interval.tv_sec  == ms / 1000L &&
+            cur.it_interval.tv_nsec == (ms % 1000L) * 1000000L &&
+            curms > 0)
+            return;
     }
     timerfd_settime(g_tfd, 0, &its, NULL);
     if (ms != g_last_set_ms) {
@@ -437,18 +425,20 @@ void retune_timer(void)
 
 /* ---------------- signals ---------------- */
 
-static volatile sig_atomic_t g_fake_enq   = 0;
-static volatile sig_atomic_t g_fake_dial  = 0;
-static volatile sig_atomic_t g_fake_ring  = 0;
+static volatile sig_atomic_t g_fake_enq    = 0;
+static volatile sig_atomic_t g_fake_dial   = 0;
+static volatile sig_atomic_t g_fake_voip   = 0;
+static volatile sig_atomic_t g_fake_alarm  = 0;
 static volatile sig_atomic_t g_fake_charge = 0;
-static volatile sig_atomic_t g_clear      = 0;
-static volatile sig_atomic_t g_clear_log  = 0;
+static volatile sig_atomic_t g_clear       = 0;
+static volatile sig_atomic_t g_clear_log   = 0;
 static volatile sig_atomic_t g_conf_reload = 0;
 
-static void on_usr1(int s){ (void)s; g_fake_enq = 1; }
-static void on_usr2(int s){ (void)s; g_clear = 1; }
-static void on_hup (int s){ (void)s; g_fake_dial = 1; }
-static void on_winch(int s){ (void)s; g_fake_ring = 1; }
+static void on_usr1 (int s){ (void)s; g_fake_enq = 1; }
+static void on_usr2 (int s){ (void)s; g_clear = 1; }
+static void on_hup  (int s){ (void)s; g_fake_dial = 1; }
+static void on_winch(int s){ (void)s; g_fake_voip = 1; }
+static void on_tstp (int s){ (void)s; g_fake_alarm = 1; }
 static void on_quit (int s){ (void)s; g_fake_charge = 1; }
 static void on_cont (int s){ (void)s; g_clear_log = 1; }
 static void on_alrm(int s)
@@ -513,6 +503,7 @@ int main(int argc, char **argv)
     install_handler(SIGUSR2, on_usr2);
     install_handler(SIGHUP,  on_hup);
     install_handler(SIGWINCH, on_winch);
+    install_handler(SIGTSTP, on_tstp);
     install_handler(SIGQUIT, on_quit);
     install_handler(SIGCONT, on_cont);
     install_handler(SIGALRM, on_alrm);
@@ -573,17 +564,26 @@ int main(int argc, char **argv)
             test_disarm("test switch");
             arm_ring_ex(1, 1);
         }
-        if (g_fake_ring) {
-            g_fake_ring = 0;
+        if (g_fake_voip) {
+            g_fake_voip = 0;
+            /* test voip call: messenger-call rainbow, held until Disarm
+             * or the configured [voip] max_sec cap */
             test_disarm("test switch");
-            arm_ring_ex(0, 1);  /* test rainbow, held */
+            voip_on();
+        }
+        if (g_fake_alarm) {
+            g_fake_alarm = 0;
+            /* test alarm: [alarm] renderer now, even if a call rainbow
+             * currently owns the channel */
+            test_disarm("test switch");
+            alarm_test();
         }
         if (g_fake_charge) {
             g_fake_charge = 0;
-            /* test charge: cycle every band once (lower/middle/upper/
-             * none), then hand the channel back to the idle refresh */
-            test_disarm("test switch");
-            arm_charge_test();
+            /* test charge: step the fake zones per press (lower -> middle
+             * -> upper -> ...), painted by [charge.<band>] config; the
+             * cycle state lives in charge.c, no pre-disarm here */
+            charge_test_next();
         }
         if (g_clear_log) {
             g_clear_log = 0;
@@ -605,13 +605,12 @@ int main(int argc, char **argv)
              * watcher saw an external writer, or the same write surfaced as
              * several queued flags. The mtime guard collapses those into a
              * single load, then the visible-state mods re-apply whatever is
-             * active and the fresh super sequencer cadence goes to NLS. */
+             * active and the connection mirror is refreshed. */
             g_conf_reload = 0;
             if (conf_file_changed()) {
                 conf_note_change();
                 conf_maybe_reload();
                 refresh_dispatch();
-                nls_push_watchdog();
                 nls_status_write(g_nls >= 0 ? 1 : 0);   /* mirror: cold-start value */
             }
         }

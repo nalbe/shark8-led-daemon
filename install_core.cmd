@@ -34,6 +34,11 @@ rem then pushes the fresh template over it (a dev-apply may be the first
 rem deploy, so no "adopt only when missing" here - the .bak is the safety).
 %ADB% shell "test -f %MOD%/led.conf && cp -f %MOD%/led.conf %MOD%/led.conf.bak || true"
 %ADB% push "%PKG%\led.conf" %MOD%/led.conf
+rem The bridge config ships with the module too (repo copy = canonical,
+rem always overwritten, same policy as led.conf). The bridge re-reads it
+rem on (re)bind - RELOAD_CONFIG is unreliable on a chilled process, so
+rem the restart below force-stops the app to force the rebind.
+%ADB% push "%PKG%\notifybridge.json" /data/local/tmp/notifybridge.json
 %ADB% push "%PKG%\service.sh" %MOD%/service.sh
 %ADB% push "%PKG%\module.prop" %MOD%/module.prop
 
@@ -41,13 +46,12 @@ rem Drop stale per-file copies that were wrongly pushed to the module root in
 rem past releases; nothing at runtime reads them (chgd is deployed as the
 rem prebuilt binary; only "mods\" is the live source tree on device).
 %ADB% shell "rm -f %MOD%/tele.c %MOD%/notify.c %MOD%/charge.c %MOD%/ring.c %MOD%/dialer.c"
-rem keepalive.sh supervision was removed in v2.12: daemon keepalive now lives
-rem in the LED GUI app (NLS watchdog restarts chgd via su at a configurable
-rem cadence, [led] watchdog_ms = 0 disables it).
+rem keepalive.sh was removed in v2.12; the NotyBridge app itself stopped
+rem supervising the daemon when it was repackaged as a pure transport.
 %ADB% shell "rm -f %MOD%/keepalive.sh"
 
 echo Restarting stack...
-%ADB% shell "kill -9 $(pidof chgd) 2>/dev/null; sleep 1; rm -f /data/local/tmp/ledd.log; chmod 755 %MOD%/chgd %MOD%/service.sh; setsid sh %MOD%/service.sh; sleep 1; pidof chgd"
+%ADB% shell "am force-stop com.bastet.notifybridge; kill -9 $(pidof chgd) 2>/dev/null; sleep 1; rm -f /data/local/tmp/ledd.log; chmod 755 %MOD%/chgd %MOD%/service.sh; setsid sh %MOD%/service.sh; sleep 1; pidof chgd"
 echo Done. Check: %ADB% shell tail -n 5 /data/local/tmp/ledd.log
 exit /b 0
 

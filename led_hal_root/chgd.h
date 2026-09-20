@@ -19,8 +19,8 @@
  *                 while the pool has work (adaptive wake; disarm is
  *                 cancel-driven)
  *     ring.c      call rainbow mode (owns "incoming.call") - [ring] sec
- *     dialer.c    missed-call verification plugin (REGISTER_HANDLER,
- *                 the only REGISTER_RULE pseudo-package: "missed.call")
+ *     dialer.c    missed-call verification plugin (REGISTER_HANDLER;
+ *                 colors come from [missed], no built-in rule)
  *     tele.c      child-process capture (call_log content query)
  *     voip.c      messenger (VoIP) call rainbow (owns "voip.call"),
  *                 driven by NLS RING/VOIP commands
@@ -108,9 +108,10 @@ extern time_t g_next_call_check;
 /* re-check heartbeat for the missed-call verification window, ms */
 #define CALL_RECHECK_MS 2000L
 
-/* safety pass: a one-shot mode without a deadline (or a defensive
- * fallback) wakes this often, so a lost cancel leaves the LED wrong
- * for at most that long */
+/* safety pass: a one-shot mode with a deadline, or the defensive
+ * ownerless-fallback, wakes this often. Purely event-driven modes with
+ * next_wake_ms()==0 (no cap) keep the timer fully DISARMED - the LED
+ * just holds and the phone sleeps until the next event. */
 #define WATCHDOG_SEC 300
 
 /* notif_max_sec is runtime-configurable via [notify] notif_max_sec in
@@ -178,6 +179,7 @@ long queue_active_remain_ms(void);              /* ms until cap, -1 no cap  */
 
 int  ring_is_active(void);          /* ring mode armed right now */
 int  alarm_is_active(void);         /* alarm mode armed right now */
+int  alarm_test(void);              /* SIGTSTP test hook: paint [alarm] now */
 int  missed_is_active(void);        /* missed-call LED armed right now */
 void arm_ring(int incoming);        /* 1 = incoming, 0 = outgoing */
 void arm_ring_ex(int incoming, int test);   /* test=1: hold, ignore telephony */
@@ -186,7 +188,7 @@ int  voip_active(void);             /* messenger-call rainbow armed now */
 int  voip_try(const char *pkg);     /* 1 if voip claimed the notification */
 int  voip_on(void);                 /* NLS call notification posted */
 int  voip_off(void);                /* NLS call notification removed */
-void arm_charge_test(void);         /* cycle all charge bands once (SIGQUIT) */
+void charge_test_next(void);        /* SIGQUIT: advance the fake charge zone */
 void maybe_call_check(void);
 void dialer_reopen_window(void);    /* reopen missed-call verify window */
 const char *dialer_pkg_id(void);    /* "com.google.android.dialer" */

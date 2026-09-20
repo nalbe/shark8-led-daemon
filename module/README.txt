@@ -3,16 +3,11 @@ led_hal_root - notification + charge LED daemon
 
 v2.17: event-driven screen detection - the last 1s poll is gone.
 
-The kernel fires no uevent when the backlight changes, so the LED NLS
+The kernel fires no uevent when the backlight changes, so the NotifyBridge
 app now forwards ACTION_SCREEN_OFF/ON as "SCREEN <0|1>" over the socket.
 A notification parked while the screen is on therefore flashes the
 instant the screen falls, with no per-second wakeup; the 1s sysfs poll
 survives only as a fallback while the bridge is down.
-
-The NLS supervisor's watchdog_ms is pushed over the same socket as
-"WD <ms>" on connect and after every GUI save (GUI -> SIGALRM -> daemon
-reload -> push). The app reads no config file: its starting cadence comes
-once from the daemon's mirror /data/local/tmp/lednls.status.
 
 v2.16: notification priority pool (mods/queue.c).
 
@@ -46,41 +41,38 @@ for how long. No per-entry timers.
     very same show on the surviving entry with the cap credit carried.
   - PULSE 0 / SIGUSR2 (Blink light off) also clears the pool.
 
-v2.14: standalone NLS bridge, daemon fully independent of the GUI.
+v2.14: standalone NotifyBridge bridge, daemon fully independent of the GUI.
 
-The notification bridge (NLS) is now a separate headless APK
-(com.bastet.lednls) installed alongside the daemon by customize.sh.
+The notification bridge is now a separate headless APK
+(com.bastet.notifybridge) installed alongside the daemon by customize.sh.
 The notification LED works without the GUI; the GUI is an optional
 configurator on top.
 
-  - NLS app (com.bastet.lednls): headless NotificationListenerService,
-    no activity, no Compose - just the socket bridge + watchdog supervisor.
-    Ships as nls.apk in the module zip, always installed by customize.sh.
+  - NotifyBridge app (com.bastet.notifybridge): headless NotificationListenerService,
+    no activity, no Compose - just the socket bridge.
+    Ships as notifybridge-release.apk in the module zip, always installed by customize.sh.
   - led_gui (com.bastet.ledgui): optional configurator with the daemon
     status screen, config editor, live brightness read. Ships as
-    led_gui.apk in the module zip, installed alongside the NLS.
+    led_gui-release.apk in the module zip, installed alongside NotifyBridge.
 
-Why the split: NLS is backend (n->n), not UI. The old design tied the
+Why the split: NotifyBridge is backend (n->n), not UI. The old design tied the
 notification bridge to the GUI APK, so no GUI meant no notification LED.
-Now a bare daemon + NLS headless gives the full notification stack.
-The watchdog supervisor also lives in the NLS app; the daemon (the only
-legitimate reader of its own config - /data/adb is 700 root, so a
-non-root app cannot even inotify it) pushes "WD <ms>" over the socket
-on every connect and after every config change, so GUI edits are applied
-in real time with zero config access from the app. The NLS only reads
-the daemon's world-readable mirror /data/local/tmp/lednls.status once
-for its starting cadence - no IPC needed, no polling.
+Now a bare daemon + NotifyBridge headless gives the full notification stack.
+GUI edits land in led.conf and are picked up by the daemon's own inotify
+watcher (SIGALRM poke is the fallback) - no config access from the apps.
+The daemon mirrors its connection state to the world-readable
+/data/local/tmp/notifybridge.status for the GUI's status screen.
 
 Critical limitation lifted: Android only logs notification_enqueue &
 friends into the events buffer on debuggable builds. Running with
 ro.debuggable=0 (hiding root from apps) means an event-log transport
 sees no notifications at all, so the LED would go dead. The standalone
-NLS app (com.bastet.lednls) runs a NotificationListenerService that
+NotifyBridge app (com.bastet.notifybridge) runs a NotificationListenerService that
 feeds chgd directly and is now the ONLY notification transport - the
 old /dev/socket/logdr (logcat events) stream is gone entirely. The
 bridge works on ANY build type:
 
-  - Transport: abstract Unix domain socket "chgd_noty" (SOCK_STREAM).
+  - Transport: abstract Unix domain socket "notify_bus" (SOCK_STREAM).
   - Protocol, one command per line:
         ENQ <pkg> <id>     onNotificationPosted
         CAN <pkg> <id>     onNotificationRemoved
@@ -90,30 +82,22 @@ bridge works on ANY build type:
         RING_ON  <0|1>     SIM call started, 1 incoming / 0 outgoing
         RING_OFF           last SIM call notification gone
         PULSE <0|1>        Settings notification_light_pulse changed
-        PING               liveness probe, daemon answers PONG
-  - On connect the NLS replays its live state (RING/VOIP + every active
+  - On connect NotifyBridge replays its live state (RING/VOIP + every active
     ENQ), so a daemon restart mid-call re-arms cleanly.
   - Ledger and arbitration live in the daemon: every ENQ enters the
     notification priority pool, cancels remove from it, the LED is
     disarmed only when the last live entry of the armed package leaves.
 
-Supervision moved into the NLS app too. keepalive.sh is gone. The NLS
-service polls whether chgd is alive and restarts it via su
-("setsid /data/adb/modules/led_hal_root/chgd &"). The cadence is
-[led] watchdog_ms in led.conf (default 60000 ms, 0 = disabled - the
-poll is pure crash insurance and every tick spawns an su shell, so it
-is opt-in and tunable in the GUI's Daemon card too; or edit the file
-directly - the daemon watches its config with inotify and pushes the
-new cadence live, no signal of any kind needed).
-The system rebinds a notification listener on its own, so a supervisor
-living in the app outlives any shell keepalive that nobody ever
-restarted. service.sh keeps its boot-time autostart so the daemon is
-up before the NLS ever runs.
+Supervision is gone. keepalive.sh was dropped long ago and the last
+supervisor - the watchdog built into the NotifyBridge app - is removed
+too: the bridge is a pure transport and restarts nothing. If chgd dies
+it stays dead until reboot or a manual start. The system rebinds a
+notification listener on its own, so the notification path comes back
+on reboot regardless.
 
-Requirements: the NLS app needs (a) notification access (Settings ->
-Special app access -> Notification access -> LED NLS) and (b) root
-granted to it in KernelSU Manager (needed for the watchdog's su). The
-daemon still runs as its own root process.
+Requirements: the NotifyBridge app needs notification access (Settings ->
+Special app access -> Notification access -> NotifyBridge). No root grant
+is needed for the app; the daemon runs as its own root process.
 
 v2.11: ID-based notification tracking + pseudo-package cancel bridge.
 
@@ -142,7 +126,7 @@ files). Adding a feature never touches the core:
 
   core (always compiled):
     core.c      main loop: select() over netlink uevents, NLS socket
-                ("chgd_noty"), adaptive timerfd (retune_timer), pkg /
+                ("notify_bus"), adaptive timerfd (retune_timer), pkg /
                 uevent / refresh dispatch, signal test hooks
     led.c       LED adapter: solid/breathing/wave calls straight into
                 the AW2033 chip controller (libaw2033.a, standalone
@@ -156,8 +140,8 @@ files). Adding a feature never touches the core:
   mods/ (extension files, pick and choose):
     charge.c    charge band eval, state file, LED application.
                 Purely event-driven: REGISTER_UEVENT "power_supply" +
-                REGISTER_REFRESH (boot/SIGALRM); its only MODE owns the
-                SIGQUIT charge test ("charge.test")
+                REGISTER_REFRESH (boot/SIGALRM); the SIGQUIT charge test
+                holds the channel via cur_pkg, no mode/timer
     queue.c     notification priority pool: LIFO pick, screen-on Q_HOLD
                 staging, preemption with resume-credit, lazy grace/
                 expiry, accumulated-cap accounting
@@ -174,7 +158,7 @@ files). Adding a feature never touches the core:
     tele.c      one-shot child-process capture (call_log content
                 query for missed-call verification)
     voip.c      messenger (VoIP) call rainbow: armed/disarmed straight
-                by VOIP_ON/VOIP_OFF over the NLS bridge - no polling
+                by VOIP_ON/VOIP_OFF over the NotifyBridge bridge - no polling
     alarm.c     alarm-clock LED with its OWN [alarm] config (color,
                 mode, cap; timing in its [alarm.breath/wave] chips) -
                 independent of [notify];
@@ -216,26 +200,25 @@ The whole daemon still compiles into one static binary.
 BOOT STACK
 ----------
   service.sh      module entry, launched by KernelSU at boot; sleeps 8s,
-                  then starts chgd. That is all - no keepalive script.
-  NLS app         (com.bastet.lednls, headless) owns daemon supervision:
-                  restarts chgd via su if it dies (configurable cadence,
-                  [led] watchdog_ms, 0 = off; the daemon pushes those ms
-                  live, see the WD command). The system rebinds the
-                  listener on its own, so the supervisor always comes
-                  back (grant notification access once).
+                  then starts chgd. That is all - nothing supervises the
+                  daemon afterwards.
+  NotifyBridge app         (com.bastet.notifybridge, headless) pure transport:
+                  forwards notifications/calls to chgd over the socket
+                  and restarts nothing. The system rebinds the listener
+                  on its own (grant notification access once).
   led_gui app     (com.bastet.ledgui, optional) configurator on top:
                   status screen, config editor, live preview.
   self-test       adb shell am startservice -n \
-                  com.bastet.lednls/.LedNotificationListenerService \
-                  -a com.bastet.lednls.POST_TEST
+                  com.bastet.notifybridge/.NotificationBridgeService \
+                  -a com.bastet.notifybridge.POST_TEST
                   posts a test notification from the app itself and arms
                   the LED through the full ENQ path.
 
 NLS BRIDGE (daemon side)
 -----------------------
-core.c:  NLS_SOCK_NAME "chgd_noty" abstract listener, accept() in
+core.c:  NLS_SOCK_NAME "notify_bus" abstract listener, accept() in
          select(); nls_cmd() parses ENQ / CAN / CAN_ALL / VOIP_ON /
-         VOIP_OFF / RING_ON / RING_OFF / PULSE / PING. On client connect
+         VOIP_OFF / RING_ON / RING_OFF / PULSE. On client connect
          g_nls gates nothing anymore - the NLS is the ONLY transport.
          Public API: notif_enqueue(pkg,id), notif_cancel(pkg,id),
          notif_cancel_all(pkg) feed pkg_dispatch / queue_remove(_all);
@@ -266,21 +249,39 @@ rise/hold/fall/offt in [notify.breath]/[notify.wave], notif_max_sec)
 lives in the [notify] base and chip sections; only the color is
 per-app via [rules] (per-app mode is not supported - rule apps run the
 [notify.app] preset).
+Pattern sync (breath/wave): the chip's per-channel pattern controllers
+free-run on their own timing and the rise/fall period grows almost
+linearly with PWM amplitude, so channels at different levels drift out
+of phase. A [sec.breath]/[sec.wave] key of sync=1 sets LCFG0.SYNC (master
+= channel 0, red): channels 1/2 slave to the master's dimming - the PWM
+written to channel 0 becomes the common amplitude, per-channel cur still
+applies, and the phases stay locked. In sync mode the color is therefore
+expressed via the per-channel cur ratio, not the rgb PWM. Default 0.
+Graphical preview calibration ([preview] section, GUI-only, the daemon
+ignores it): the picker swatch and the Info live swatch simulate what
+the physical LED set shows - each channel scaled by its luminous weight
+(green=100 reference) and a perception curve (gamma). r=50 the stock
+value: cheap red diodes are ~half as bright as green at equal PWM/cur.
+To tune: drive all three channels with the same known PWM/cur, compare
+the swatch against the light, adjust r/g/b and gamma in led.conf, press
+Reload in the GUI. While sync=1 is on, the GUI greys out the dead G/B
+PWM and t0 knobs (the master red drives them) and previews the light
+from the red duty x the per-channel cur that actually fires.
 Missed calls (verified via root content query on call_log:
 type=3 new=1, fresh <=120s, dedup by _id):
   com.google.android.dialer -> missed.call  blue          0,0,255
-Incoming call (NLS classifies the dialer's live-call notification, sends
+Incoming call (NotifyBridge classifies the dialer's live-call notification, sends
 RING_ON 1):
   traveling-wave rainbow on the AW2033 chip (led_wave_rgb: per-channel
   phase offset staggers R/G/B so the color glides R->G->B->R), until the
   ring ends; RING_OFF resolves the outcome event-driven: incoming ->
   reopens the missed-call verification window, then drops to
   blue breath / charge leds. No telephony polling, no focus tracker.
-Outgoing call (NLS sends RING_ON 0):
+Outgoing call (NotifyBridge sends RING_ON 0):
   identical wave for the whole call; RING_OFF just drops back to the
   charge leds (no missed-call check for outgoing calls).
 Messenger / VoIP call (Telegram/WhatsApp/Viber/Signal/Snapchat/Duo):
-  the NLS app classifies call notifications (category CALL, a channel
+  the NotifyBridge app classifies call notifications (category CALL, a channel
   id containing "call" - Telegram's incoming_calls40 - or Answer /
   Decline / Reject / End-call actions on a messenger package) and sends
   VOIP_ON/VOIP_OFF over the socket; the LED runs the same wave while
@@ -296,9 +297,9 @@ Suppressed (led.conf [suppress] only, plus nothing else - the builtin
 list in mods/suppress.c was removed): com.android.systemui, android,
 com.android.shell, org.amnezia.vpn, and the quiet background emitters.
 The LED adapter lives in led.c, call handling in mods/dialer.c, ring
-policy in mods/ring.c. Test-wave hold and other mod settings go in
-their own led.conf sections, e.g. [ring] test_sec=30
-(any unknown key is readable by the mod via conf_get_int).
+policy in mods/ring.c. Mod settings go in their own led.conf sections,
+e.g. [ring] max_sec (safety cap; a test rainbow holds until Disarm or
+that cap) - any unknown key is readable by the mod via conf_get_int.
 
 Charge bands. Ranges are named abstractly (lower/middle/upper) and the
 behavior per range - renderer mode and color - is configured in the
@@ -322,11 +323,9 @@ led_chg              "<band> <epoch>" current charge band
 led_status           live LED-owner state for GUI: ts / mode (charge |
                      notify | ring | voip | missed | alarm) / band /
                      pkg / color=r,g,b / engine
-lednls.status        NLS bridge state, written by the daemon itself on
-                     client accept/EOF: connected=1|0 plus the live
-                     watchdog_ms= cadence the NLS reads once at startup
+notifybridge.status        NotifyBridge bridge state, written by the daemon itself on
+                     client accept/EOF: connected=1|0
 led_chgd.lock        flock lock
-(led_keepalive.pid was dropped in v2.12 with keepalive.sh)
 
 REBUILD
 -------
@@ -339,30 +338,31 @@ adb push chgd $MOD/ && adb shell chmod 755 $MOD/chgd
 then restart: kill -9 $(pidof chgd); setsid sh $MOD/service.sh
 or just run install_core.cmd from the package root (rebuilds + pushes
 everything + restarts). Both APKs ship inside the module zip:
-  - nls.apk       notifications bridge + watchdog (HEADLESS, required
+  - notifybridge-release.apk   notifications bridge (HEADLESS, required
                   for notification LED on any build type)
-  - led_gui.apk   optional configurator
+  - led_gui-release.apk   optional configurator
 customize.sh installs/refreshes both on every module install.
-install_nls.cmd rebuilds nls.apk into the staging dir; install_gui.cmd
+install_nls.cmd rebuilds notifybridge-release.apk into the staging dir; install_gui.cmd
 does the same for the GUI (or installs it directly to a device).
 
 TESTING
 -------
-Screen off, then: kill -USR1 $(pidof chgd)   -> Telegram color breathing
-                 kill -HUP  $(pidof chgd)   -> blue breathing if call_log
-                                                has a fresh missed row
-                 kill -WINCH $(pidof chgd)  -> rainbow (ring, held in test)
-                 kill -QUIT  $(pidof chgd)  -> charge band cycle (lower/
-                                                middle/upper/none)
+Screen off, then: kill -USR1 $(pidof chgd)   -> notify test (telegram pkg,
+                                                 color = [notify] default)
+                 kill -HUP  $(pidof chgd)   -> call test (rainbow, held)
+                 kill -WINCH $(pidof chgd)  -> voip test (rainbow, held)
+                 kill -TSTP  $(pidof chgd)  -> alarm test ([alarm] renderer)
+                 kill -QUIT  $(pidof chgd)  -> charge: each press steps
+                                                 lower/middle/upper and round
 Disarm (USR2)                        -> back to the charge leds
-NLS bridge end-to-end: am startservice -n \
-    com.bastet.lednls/.LedNotificationListenerService \
-    -a com.bastet.lednls.POST_TEST    -> notification posted from the app
+NotifyBridge bridge end-to-end: am startservice -n \
+    com.bastet.notifybridge/.NotificationBridgeService \
+    -a com.bastet.notifybridge.POST_TEST    -> notification posted from the app
                                          itself; watch "notify armed:" in
                                          ledd.log -> LED breathes; snooze it
                                          (cmd notification snooze --for 60000
                                          <key>) -> CAN -> disarm
-SIM call: straight from the NLS bridge - the dialer's live-call
+SIM call: straight from the NotifyBridge bridge - the dialer's live-call
 notification is classified in the app and sent as RING_ON; let it ring
 then reject -> RING_OFF + missed-call verification (ledd.log shows
 "ring ended (RING_OFF) -> missed check" then a missed arm).

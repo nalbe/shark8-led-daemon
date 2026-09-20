@@ -234,8 +234,3 @@ static int dialer_handle(const char *pkg, int id)
 
 REGISTER_HANDLER(DIALER_PKG, dialer_handle);
 REGISTER_MODE_WAKE("missed", 1000, missed_owns, missed_tick, missed_next_wake);
-
-/* missed-call pseudo-package colour lives in [missed] color and is
- * painted directly by missed_paint(); the rule below keeps the link-time
- * chgd_rules section populated so the core/config registries stay alive. */
-REGISTER_RULE(MISSED_PKG, 0, 0, 255);

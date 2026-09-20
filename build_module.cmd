@@ -8,7 +8,9 @@ rem  from exactly two sources:
 rem    led_hal_root\   daemon core only   (C sources, mods\, build.cmd)
 rem    module\         module packaging   (customize.sh, service.sh,
 rem                      module.prop, led.conf, META-INF, README.txt,
-rem                      nls.apk, led_gui.apk, awctl prebuilt)
+rem                      notifybridge-release.apk,
+rem                      led_gui-release.apk,
+rem                      awctl prebuilt)
 rem  The zip is the union of those two folders - nothing else.
 rem  awctl is NOT rebuilt here: the binary in module\ comes prebuilt
 rem  from the standalone aw2033-driver repo (sources + build there;

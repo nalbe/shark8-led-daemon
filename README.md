@@ -3,16 +3,18 @@
 KernelSU module that drives the AW2033 RGB notification/charge LED on a
 rooted Blackview Shark 8 running a ported Pixel GSI ROM. A single
 event-driven daemon (`chgd`) programs the chip - no polling scripts exist
-outside of two short device-side boots and a bounded screen-state
-fallback.
+outside of two short device-side boots, a bounded screen-state fallback,
+and the 60s charge-band recheck (see charge.c: this kernel fires a
+POWER_SUPPLY uevent only on plug/unplug, so a mid-charge threshold
+crossing would otherwise never repaint).
 
 Both companion apps ship inside the flashable zip, but only one of them
 is this project's:
 
-- **LED NLS** (`nls.apk`, `com.bastet.lednls`) - the required headless
-  notification bridge + watchdog. It is a **standalone project**
-  (`noty-bridge` repo); this repo only consumes its `nls.apk` artifact.
-- **LED GUI** (`led_gui.apk`, `com.bastet.ledgui`) - the optional
+- **NotifyBridge** (`notifybridge-release.apk`, `com.bastet.notifybridge`) - the required headless
+  notification bridge. It is a **standalone project**
+  (`android-notify-bridge` repo); this repo only consumes its `notifybridge-release.apk` artifact.
+- **LED GUI** (`led_gui-release.apk`, `com.bastet.ledgui`) - the optional
   configurator. **This** project's app, lives here under `led_gui/`.
 
 The AW2033 chip controller is also external: the packed `libaw2033.a` +
@@ -27,26 +29,26 @@ led_hal_root/   daemon core only (C sources, mods/, build.cmd) -> chgd
 led_gui/        optional configurator app (com.bastet.ledgui)
 module/         module packaging: customize.sh, service.sh, module.prop,
                 led.conf, META-INF, README.txt, awctl prebuilt,
-                nls.apk (from noty-bridge) + led_gui.apk
+                notifybridge-release.apk (from android-notify-bridge) + led_gui-release.apk
 release/        flashable zip output (led_hal_root-v<ver>.zip)
 aw2033-driver/  libaw2033.a + aw2033.h ONLY (prebuilt chip controller)
 ```
 
 Build scripts: `build_module.cmd` (full release), `build.cmd` (chgd
 only), `install_core.cmd` (build + deploy to device), `install_gui.cmd`
-(build GUI app), `install_nls.cmd` (consume the noty-bridge nls.apk).
+(build GUI app), `install_nls.cmd` (consume the notify-bridge notifybridge-release.apk).
 
 ## Install
 
-1. Download [`led_hal_root-v2.17.zip`](https://github.com/nalbe/shark8-led-daemon/releases/latest) (flashable KernelSU module)
+1. Download [`led_hal_root-v3.0.zip`](https://github.com/nalbe/shark8-led-daemon/releases/latest) (flashable KernelSU module)
 2. Flash in KernelSU Manager -> Modules -> Install from storage
 3. `customize.sh` installs both apps automatically (`pm install -r`,
    non-fatal on failure):
-   - **LED NLS** - required for the notification/call/VoIP/alarm LEDs
+   - **NotifyBridge** - required for the notification/call/VoIP/alarm LEDs
    - **LED GUI** - optional configurator
-4. Grant **LED NLS** Notification access (Settings -> Special app access
-   -> Notification access -> LED NLS) and **root** (KernelSU Manager).
-   LED GUI also needs root for its status/config screen.
+4. Grant **NotifyBridge** Notification access (Settings -> Special app access
+   -> Notification access -> NotifyBridge). LED GUI additionally needs root
+   (KernelSU Manager) for its status/config screen.
 5. Reboot
 
 The `led.conf` shipped inside the module is canonical and is **always
@@ -75,7 +77,12 @@ Events:
 
 - **charge** - three bands (lower/middle/upper), each with its own
   renderer, thresholds in `[charge]` (`first_threshold` /
-  `second_threshold`, order-free)
+  `second_threshold`, order-free). Re-evaluated on `power_supply`
+  uevents (plug/unplug), on SIGALRM/inotify, and - because this kernel
+  silently tricks past capacity thresholds - on a 60s recheck that owns
+  the idle channel while the charger is live. The recheck repaints only
+  on a real band/color/mode change (fingerprint-gated) and dies the
+  moment the status leaves Charging/Full.
 - **notification** - two presets: `[notify]` for apps without a rule,
   `[notify.app]` for apps that have a `[rules]` color entry
 - **ring** - SIM/dialer calls, incoming and outgoing
@@ -125,9 +132,15 @@ edges (the bridge's screen event, a cancel, or a cap deadline):
 
 ### Notification transport
 
-The daemon talks only to the standalone headless **LED NLS** app over the
-abstract Unix socket `chgd_noty`. The default contract (see the
-noty-bridge repo for the configurable rule set):
+The daemon talks only to the standalone headless **NotifyBridge** app over
+the abstract Unix socket `notify_bus`. The bridge config needed by the
+module rides inside the zip as `module/notifybridge.json`
+(`/data/local/tmp/notifybridge.json` on the device - deployed by
+`customize.sh` on flash and `install_core.cmd` on dev-apply, always
+overwritten like `led.conf`): the ENQ/CAN/RING/VOIP/SCREEN/PULSE rule set
+plus the `notification_light_pulse` setting watcher that powers the
+blink-light gate. The full rule language is configurable - see the
+notify-bridge repo. The wire format the daemon expects:
 
 ```
 ENQ <pkg> <id>        notification posted        -> pool push
@@ -139,8 +152,6 @@ VOIP_ON <pkg>         messenger call             -> voip plane
 VOIP_OFF <pkg>        messenger call notification gone
 SCREEN <0|1>          screen off/on              -> park flash / grace
 PULSE <0|1>           notification_light_pulse changed by any writer
-PING -> PONG          liveness probe on connect
-WD <ms>               daemon -> app supervision cadence push
 ```
 
 On connect the client **replays its live state** (SCREEN, active
@@ -161,28 +172,24 @@ the test hooks are daemon-side and unaffected.
 
 ### Supervision
 
-The bridge supervises chgd at the cadence pushed as **`WD <ms>`**
-(`[led] watchdog_ms` in `led.conf`, default 60000, `0` disables). The GUI
-edits the key and SIGALRMs the daemon; as root the daemon is the only
-legitimate reader of its own config (a non-root app cannot even inotify
-`/data/adb` - it is `700 root`), so it reloads and pushes the fresh value
-- applied event-driven, no mtime polling, no config access from the app.
-The app's only config read is a one-time starting value from the daemon's
-world-readable mirror `/data/local/tmp/lednls.status`. The system rebinds
-notification listeners on its own, so supervision outlives any shell
-keepalive. `service.sh` only guarantees the daemon is up right after boot.
+None. The v2.x daemon used to be kept alive by a supervisor built into
+the bridge; it was removed when NotifyBridge was repackaged as a pure
+transport (app v2.0.0) - chgd is no longer watched or restarted from
+anywhere. If the daemon dies it stays down until reboot or a manual
+start (`service.sh`). `service.sh` only guarantees the daemon is up right
+after boot. No `WD` push, no `[led] watchdog_ms`, no root grant for the
+app.
 Set `trace_sysfs=1` in `[led]` for debug-only per-write sysfs tracing.
 
 ## LED GUI - optional configurator
 
-The daemon + LED NLS work fine without it. The GUI is a Kotlin/Android
+The daemon + NotifyBridge work fine without it. The GUI is a Kotlin/Android
 Views app (runs smooth at 120Hz on this firmware) with a follow-the-finger
 swipe pager and six tabs:
 
 - **Info** - root status (persistent explainer when su is hidden / "Open
-  KernelSU Manager" button), daemon PID + NLS watchdog interval, bridge
-  connect state (reads `lednls.status`) + one-tap Notification access
-  grant, live LED swatch with the active renderer/engine and chip imax,
+  KernelSU Manager" button), daemon PID, bridge connect state (reads
+  `notifybridge.status`) + one-tap Notification access grant, live LED swatch with the active renderer/engine and chip imax,
   test hooks (fake Telegram / incoming / outgoing / Charge cycle /
   Disarm), log tail with the `[led] logging` toggle
 - **Charge** - thresholds (`[charge]` first/second) + one renderer card
@@ -200,7 +207,7 @@ swipe pager and six tabs:
 All changes save to `led.conf` and SIGALRM the daemon - they take effect
 on the next daemon event, no restart, no rebuild. Requires root
 (KernelSU). Build with `install_gui.cmd` or install the bundled
-`led_gui.apk`.
+`led_gui-release.apk`.
 
 ## Build from source
 
@@ -224,8 +231,9 @@ The chip sources are **not** here - rebuild `libaw2033.a` and `awctl` in
 the standalone [aw2033-driver](https://github.com/nalbe/aw2033-driver)
 repo and drop the artifacts into `aw2033-driver/` / `module/awctl`
 (`build_module.cmd` packages `module/awctl` as-is, no rebuild). Similarly,
-the NLS bridge builds in the standalone noty-bridge repo;
-`install_nls.cmd` only copies its `app-debug.apk` to `module/nls.apk`.
+the NotifyBridge app builds in the standalone android-notify-bridge repo;
+`install_nls.cmd` only copies its `notifybridge-release.apk` to
+`module/notifybridge-release.apk`.
 
 ## Deploy
 
@@ -241,7 +249,7 @@ This rebuilds, pushes all module files, and restarts the daemon.
 
 ```bash
 kill -USR1 $(pidof chgd)   # fake Telegram notification (test mode, ignores screen)
-kill -HUP  $(pidof chgd)   # test INCOMING call (in-call renderer, held ~30s / [ring] test_sec)
+kill -HUP  $(pidof chgd)   # test INCOMING call (renderer held until Disarm / [ring] max_sec)
 kill -WINCH $(pidof chgd)  # test OUTGOING call (same renderer, held)
 kill -QUIT  $(pidof chgd)  # cycle charge bands: lower -> middle -> upper -> none
 kill -USR2  $(pidof chgd)  # "Blink light" toggle OFF: invalidate pulse cache + disarm notify LED
@@ -255,9 +263,9 @@ kill -ALRM  $(pidof chgd)  # force led.conf reload + re-apply visible state (GUI
   `color=`/`engine=`, where `engine` (`off`/`solid`/`breath`/`wave`) tells
   a consumer whether the raw brightness node reflects what the eye sees -
   chip-driven patterns read a constant peak, solid reads the real color.
-- `/data/local/tmp/lednls.status` - bridge connect state
-  (`connected=1|0`) plus the active watchdog cadence (`watchdog_ms=`),
-  written by the daemon on accept/EOF and after every reload.
+- `/data/local/tmp/notifybridge.status` - bridge connect state
+  (`connected=1|0`), written by the daemon on accept/EOF and after every
+  reload.
 
 ## The chip debugging CLI - awctl
 
@@ -271,25 +279,26 @@ repo.
 ## Release history
 
 See [PATCHNOTES.md](PATCHNOTES.md) - kept to the daemon core and the GUI
-(noty-bridge and aw2033-driver keep their own changelogs).
+(notify-bridge and aw2033-driver keep their own changelogs).
 
 ## Architecture
 
 ```
 core.c    - main loop: select() over netlink uevents, the NLS client socket
             and the adaptive one-shot timerfd; NLS command pipeline
-            (ENQ/CAN/CAN_ALL, RING_ON/OFF, VOIP_ON/OFF, PULSE, PING);
+            (ENQ/CAN/CAN_ALL, RING_ON/OFF, VOIP_ON/OFF, PULSE);
             signal test hooks; lockfile
 led.c     - per-event renderer adapter: resolves [sec] mode=off|solid|breath|wave
             and programs the AW2033 chip through aw2033.h (the ONLY LED writer;
             all animation runs on-chip)
 config.c  - led.conf parser + generic key-value store for mods
-util.c    - logging, sysfs helpers, led_status + lednls.status files, screen
+util.c    - logging, sysfs helpers, led_status + notifybridge.status files, screen
             detection, notification_light_pulse gate
 
 mods/
   charge.c  - charge band eval ([charge] thresholds only) + per-band renderer
-              apply; idle repaint on power_supply uevents / refresh
+              apply; idle repaint on power_supply uevents / refresh / the
+              60s charging recheck (the kernel uevent gap)
   queue.c   - notification priority pool: LIFO pick, screen-on Q_HOLD staging,
               preemption with resume-credit, lazy grace/expiry, cap accrue
   notify.c  - notification gate (suppress -> per-app color -> [notify]/

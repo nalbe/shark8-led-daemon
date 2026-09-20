@@ -265,6 +265,12 @@ retry:
         LOGI("queue: %s reposted, stays armed", e->pkg);
         return;
     } else if (q_active_ev()) {
+        /* A live show survives a screen-on re-arbitration untouched such
+         * that turning the screen back on never kills the blinking LED.
+         * Preempt stays reserved for a genuinely fresh post, and only
+         * while the screen is down (with the screen up nothing new may
+         * show anyway - it parks, so stealing the channel is pointless). */
+        if (screen_on()) return;
         q_preempt_current();
     } else {
         return;                      /* test / charge channel: held */

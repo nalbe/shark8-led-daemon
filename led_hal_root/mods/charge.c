@@ -5,9 +5,22 @@
  * idle heartbeat: at true idle the core disarms the timer and the band
  * repaints only when a power_supply uevent arrives or led.conf is edited
  * (SIGALRM refresh). Registered two ways:
- *   REGISTER_REFRESH   boot + SIGALRM (led.conf edited): re-evaluate
- *   REGISTER_UEVENT    "power_supply" uevents: same re-evaluation
- *   REGISTER_MODE      only for the SIGQUIT charge test ("charge.test")
+*     REGISTER_REFRESH   boot + SIGALRM (led.conf edited): re-evaluate
+ *     REGISTER_UEVENT    "power_supply" uevents: same re-evaluation. NOTE:
+ *                        on this kernel the POWER_SUPPLY uevent fires only
+ *                        on plug/unplug - a mid-charge capacity trickle
+ *                        past a threshold (lower -> middle -> upper)
+ *                        broadcasts nothing.
+ *     REGISTER_MODE      "charge" owns the idle channel ("") while the
+ *                        charger is live: a 60s recheck re-evaluates the
+ *                        band and repaints only on a real change
+ *                        (fingerprint-gated, no LED blip). The kernel gap
+ *                        is the recheck's only job and the cadence dies
+ *                        the moment the status leaves charging.
+ *                        queue_has_pending() / queue_active() defer "" to
+ *                        the notification pool, so a parked or showing
+ *                        notification never competes with the recheck.
+ *     SIGQUIT charge test: holds the channel via cur_pkg, no mode/timer
  * The band is recomputed on battery uevents and written to the state
  * file; the LEDs are rewritten only on real state changes
  * (g_applied_band fingerprint: band + colors + mode).
@@ -57,6 +70,16 @@
  * the first byte to NUL, forcing a reapply on the next charge pass. */
 char g_applied_band[64] = "\x01INIT";
 
+/* Charge recheck cadence. This kernel's POWER_SUPPLY uevent fires only
+ * on plug/unplug; a capacity crossing mid-charge is silent. While the
+ * charger is live and nobody else owns the idle channel, one 60s tick
+ * re-evaluates the band (two sysfs reads; the g_applied_band fingerprint
+ * keeps the repaint silent until the band actually changes). The mode
+ * owns "" only while charging/full AND the notification pool is empty. */
+#define CHARGE_RECHECK_MS 60000L
+
+static int g_charge_live;    /* 1 = status Charging/Full at last eval */
+
 static const char *band_for(const char *status, const char *cap)
 {
     int c = -1;
@@ -90,6 +113,10 @@ long eval_and_write(void)
     char status[64] = "", cap[16] = "";
     read_line("/sys/class/power_supply/battery/status", status, sizeof(status));
     read_line("/sys/class/power_supply/battery/capacity", cap, sizeof(cap));
+
+    /* mark whether the charge recheck cadence should stay armed: plugged
+     * and charging/full only. Discharging / Not charging -> cadence off. */
+    g_charge_live = (!strcmp(status, "Charging") || !strcmp(status, "Full")) ? 1 : 0;
 
     const char *band = band_for(status, cap);
     long ts = (long)time(NULL);
@@ -189,59 +216,84 @@ void apply_charge_leds(void)
 /* ---------------- registry hooks ---------------- */
 
 /* the one refresh: write the band, repaint the LEDs unless another
- * owner (notify/ring) is currently showing something. */
+ * owner (notify/ring) is currently showing something, and re-tune the
+ * timer so the charging recheck cadence arms on plug / dies on unplug. */
 static void charge_refresh(void)
 {
     (void)eval_and_write();
     if (!g_st.cur_pkg[0])
         apply_charge_leds();
+    retune_timer();
 }
 
-/* ---------------- charge test mode (SIGQUIT) ---------------- */
+/* ---------------- charge zone test (SIGQUIT) ---------------- */
 
-/* Cycles every charge band once on the LED exactly as led.conf paints
- * them (3s per band), then releases the channel back to the idle
- * refresh. A MODE like ring, so the core timer drives it by heartbeat. */
+/* Each press advances the fake charge zone lower -> middle -> upper ->
+ * and round. The [charge.<band>] config fully decides color + renderer
+ * via led_event(), nothing is hardcoded. The fake zone is NOT timed: no
+ * mode, no cadence - it holds until the next press or Disarm. */
 #define CHARGE_TEST_PKG "charge.test"
-#define CHARGE_TEST_MS  3000
 
 static int g_charge_test_seq;
+
+static const char *charge_test_band(int seq)
+{
+    switch (seq % 3) {
+    case 0: return "lower";
+    case 1: return "middle";
+    default: return "upper";
+    }
+}
 
 static int charge_test_owns(const char *pkg)
 {
     return pkg && !strcmp(pkg, CHARGE_TEST_PKG);
 }
 
-static void charge_test_tick(void)
+void charge_test_next(void)
 {
-    switch (g_charge_test_seq++) {
-    case 0: apply_band("lower");  break;
-    case 1: apply_band("middle"); break;
-    case 2: apply_band("upper");  break;
-    case 3: apply_band("none");   break;
-    default:
-        /* released: the real idle state takes over again */
-        g_st.cur_pkg[0] = '\0';
-        g_st.test = 0;
-        apply_charge_leds();
-        retune_timer();
-        LOGI("charge test done");
-        break;
+    if (!charge_test_owns(g_st.cur_pkg)) {
+        /* fresh session: drop whatever owns the channel, start at lower */
+        if (g_st.cur_pkg[0])
+            disarm_notification(&g_st, "test switch");
+        g_charge_test_seq = 0;
     }
-}
-
-void arm_charge_test(void)
-{
-    g_applied_band[0] = '\0';       /* force a real repaint on release */
-    g_charge_test_seq = 0;
+    g_applied_band[0] = '\0';       /* force a real repaint */
     snprintf(g_st.cur_pkg, sizeof(g_st.cur_pkg), "%s", CHARGE_TEST_PKG);
     g_st.armed_at = time(NULL);
     g_st.test = 1;
-    retune_timer();
-    charge_test_tick();             /* first band immediately */
-    LOGI("charge test armed");
+    const char *band = charge_test_band(g_charge_test_seq);
+    apply_band(band);
+    LOGI("charge test -> %s", band);
+    g_charge_test_seq++;
 }
 
 REGISTER_REFRESH(charge_refresh);
 REGISTER_UEVENT("power_supply", charge_refresh);
-REGISTER_MODE("charge test", CHARGE_TEST_MS, charge_test_owns, charge_test_tick);
+
+/* ---------------- charge recheck cadence ----------------
+ * mode_owns() consults this with cur_pkg == "" whenever the channel is
+ * free. Ownership of "" is shared with the notification pool: notify
+ * claims it while queue entries wait (its own adaptive cadence), charge
+ * claims it only while the charger is live AND the pool is empty. The
+ * two conditions are mutually exclusive, so the linker section order of
+ * the two modes never matters.
+ *
+ * The tick re-runs the full band evaluation + fingerprint-gated repaint,
+ * so a silenty crossed threshold lights up within one recheck period.
+ * The timer goes away the moment the pool regains work or the status
+ * leaves Charging/Full. */
+static int charge_owns(const char *pkg)
+{
+    if (pkg && pkg[0]) return 0;
+    if (queue_active() || queue_has_pending())   /* notify's idle claim */
+        return 0;
+    return g_charge_live;
+}
+
+static void charge_tick(void)
+{
+    charge_refresh();
+}
+
+REGISTER_MODE("charge", CHARGE_RECHECK_MS, charge_owns, charge_tick);
