@@ -209,6 +209,20 @@ on the next daemon event, no restart, no rebuild. Requires root
 (KernelSU). Build with `install_gui.cmd` or install the bundled
 `led_gui-release.apk`.
 
+### Screenshots
+
+| Info | Charge |
+| --- | --- |
+| <img src="screenshots/01-info.png" width="270"> | <img src="screenshots/02-charge.png" width="270"> |
+
+| Call | Alarm |
+| --- | --- |
+| <img src="screenshots/03-call.png" width="270"> | <img src="screenshots/04-alarm.png" width="270"> |
+
+| Notification | LED GUI |
+| --- | --- |
+| <img src="screenshots/06-notification.png" width="270"> | <img src="screenshots/08.png" width="270"> |
+
 ## Build from source
 
 Requires [Android NDK r27d](https://developer.android.com/ndk/downloads).
