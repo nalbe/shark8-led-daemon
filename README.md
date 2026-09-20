@@ -211,6 +211,9 @@ on the next daemon event, no restart, no rebuild. Requires root
 
 ### Screenshots
 
+<details>
+<summary>Show LED GUI screenshots</summary>
+
 | Info | Charge |
 | --- | --- |
 | <img src="screenshots/01-info.png" width="270"> | <img src="screenshots/02-charge.png" width="270"> |
@@ -226,6 +229,8 @@ on the next daemon event, no restart, no rebuild. Requires root
 | VoIP | Alarm |
 | --- | --- |
 | <img src="screenshots/07-voip.png" width="270"> | <img src="screenshots/08-alarm.png" width="270"> |
+
+</details>
 
 ## Build from source
 
