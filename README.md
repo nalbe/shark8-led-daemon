@@ -215,17 +215,17 @@ on the next daemon event, no restart, no rebuild. Requires root
 | --- | --- |
 | <img src="screenshots/01-info.png" width="270"> | <img src="screenshots/02-charge.png" width="270"> |
 
-| Call | Alarm |
+| Notification | Notification |
 | --- | --- |
-| <img src="screenshots/03-call.png" width="270"> | <img src="screenshots/04-alarm.png" width="270"> |
+| <img src="screenshots/03-notification.png" width="270"> | <img src="screenshots/04-notification.png" width="270"> |
 
-| Notification | Notification (alternate capture) |
+| Notification | Call |
 | --- | --- |
-| <img src="screenshots/06-notification.png" width="270"> | <img src="screenshots/07-notification.png" width="270"> |
+| <img src="screenshots/05-notification.png" width="270"> | <img src="screenshots/06-call.png" width="270"> |
 
-| Alarm (alternate capture) | LED GUI |
+| VoIP | Alarm |
 | --- | --- |
-| <img src="screenshots/05-alarm.png" width="270"> | <img src="screenshots/08.png" width="270"> |
+| <img src="screenshots/07-voip.png" width="270"> | <img src="screenshots/08-alarm.png" width="270"> |
 
 ## Build from source
 
