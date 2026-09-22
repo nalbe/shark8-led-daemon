@@ -9,6 +9,171 @@ out of here:
 - the AW2033 chip controller and `awctl` live in the **aw2033-driver** repo
   (this repo ships only the prebuilt `libaw2033.a`)
 
+## Revision: missed-call LED is 100% bridge events; the last child process is gone (2026-09-23, v3.5)
+
+1. **The last `content query` fork is deleted.** `mods/dialer.c` +
+   `mods/tele.c` (missed-call verification: root `content query
+   content://call_log/calls`, freshness filter, dedup, 4x2s verification
+   window, `run_capture()` child-process capture) are gone - the REPLACEMENT
+   is `mods/missed.c`, a pure event mode.
+3. **Bridge now classifies missed tombstones itself (notify-bridge side).**
+   The bridge already separated the dialer's `missed_calls` channel from
+   live calls (`isSimCallNotification`); instead of passing the tombstone
+   through as a plain `notify.posted` it now emits `missed.on` when the
+   tombstone posts and `missed.off` when it leaves, tracks the live set
+   (`missedNotifs`) and replays it on connect. The dialer package is fully
+   classified (ring | missed) and NEVER forwarded as a raw ENQ, so the
+   daemon's pool never sees dialer events and no package claim is needed.
+4. **Daemon: `MISSED_ON` / `MISSED_OFF` NLS commands.** `core.c` parses
+   them; `missed_on()` arms the `[missed]` renderer, `missed_off()` disarms
+   when the mode owns the channel. A call end no longer reopens a
+   verification window (`ring_resolve` lost `dialer_reopen_window()`) -
+   the tombstone event IS the missed call. Deleted: `g_last_missed_id`,
+   `g_call_checks_left`/`CALL_RECHECK_MS` (and the `retune_timer` branch),
+   `g_next_call_check`, `maybe_call_check()`, the SIGHUP-to-dialer test
+   path became SIGPWR-to-missed, `dialer_pkg_id()`.
+5. **VoIP package list deleted (also a dead hardcode).** `VOIP_DEF_PKGS`,
+   `voip_pkg_list()`, `is_messenger()` and `voip_try()` were dead: the
+   bridge classifies call notifications by category/channel, not by
+   package name, and `voip_try` had no callers. The pool already yields to
+   an active ring/voip/missed/alarm (`queue_arbitrate` early-out), so no
+   package list is needed to keep chats from recoloring the rainbow. The
+   `[voip] packages=` config, the GUI's VoIP package editor and its
+   led.conf serialization are removed too.
+6. **notify_tick() wrapper deleted.** The notify mode's tick was a
+   one-line shim around `queue_arbitrate()`; the pool policy is now
+   registered directly as the mode tick, and the "armed tick" periodic log
+   is gone.
+7. **Live-tested on the Shark8:** SIGPWR arms the missed LED (blue breath
+   from `[missed]`), SIGUSR2 disarms it; bridge reconnect replays SCREEN
+   and the PULSE gate. `Settings.System.notification_light_pulse` was off
+   on the device, so the notification pool correctly idles (the toggle
+   still gates only the notification LED; ring/voip/missed/alarm planes
+   are unaffected). Docs updated: README (wire format, architecture,
+   module list), module.prop bumped to 3.5 / versionCode 25,
+   notifybridge.json routes gained `missed.on`/`missed.off`.
+
+## Revision: blink-light gate is 100% bridge events too (2026-09-23, v3.4)
+
+1. **The last settings read is gone: no more `settings get` fork.** The
+   "Blink light" gate (`arm_notification_ex()`) used `light_pulse_enabled()`
+   which forked `/system/bin/settings get system notification_light_pulse`
+   on every arm (3s TTL cache, `light_pulse_invalidate()` to force a
+   re-read). The notify-bridge already watches
+   `Settings.System.notification_light_pulse` with a ContentObserver and
+   forwards every real change as `PULSE 0|1` - so the daemon read was a
+   duplicate of an event it already receives, with a shell fork attached.
+   Deleted: the `settings get` argv, `LIGHT_PULSE_TTL`/`s_pl_last`/
+   `s_pl_val` cache, `light_pulse_enabled()`, `light_pulse_invalidate()`
+   and their `chgd.h` declarations.
+2. **`pulse_on()` / `pulse_note()`: a screen-style state pair.** The daemon
+   now stores the toggle from the NLS `PULSE` command only (`pulse_note`,
+   the core.c handler and the GUI's SIGUSR2 both feed it) and the next arm
+   gates on `pulse_on()`; unknown before the first event = on (Android's
+   default), same fault-tolerance as before.
+3. **Bridge: PULSE now replays on connect (notify-bridge side).** The
+   connect replay covered SCREEN/ring/voip/ENQ but NOT watched settings -
+   the old daemon worked around that gap by re-reading the toggle itself.
+   `replayInto()` now re-emits the current polarity of every watched
+   setting (same contract as the screen snapshot, before ring/ENQ so a
+   fresh consumer learns the toggle first). Forwarding of live changes is
+   unchanged.
+4. **notify-bridge repo build plumbing: the `release/` folder is a junction
+   onto `app/build/outputs/apk/release`.** AGP's `stageReleaseApk` copy
+   task wrote the APK into it = copying the file onto itself through the
+   junction, producing a 0-byte artifact. The copy task and the redundant
+   `build-release.bat` copy are removed - AGP's single write lands in the
+   junction target directly and stays visible under `release/`.
+5. **Audit of every remaining "side read":** the only child-process capture
+   left in the daemon is the dialer's `content query` on call_log
+   (missed-call verification) - it has no bridge event equivalent (the
+   bridge classifies SIM calls but cannot read call_log), so it stays, and
+   it is event-triggered with dedup, never a poll. Status/config runtime
+   paths under `/data/local/tmp` are script-owned state files, not
+   hardware. No other sysfs/settings reads remain.
+6. Docs updated: README (wire format, system gates, SIGUSR2 hook,
+   architecture map), module.prop bumped to 3.4 / versionCode 24,
+   notifybridge.json comment mentions the connect replay.
+
+## Revision: screen state is 100% bridge events, last sysfs hardcode gone (2026-09-23)
+
+1. **The daemon no longer touches ANY sysfs for device state.** The screen
+   detection in `util.c` used to read
+   `/sys/class/leds/lcd-backlight/brightness` then
+   `/sys/class/graphics/fb0/blank` whenever the bridge was not feeding
+   `SCREEN` events (socket EOF -> `screen_source_reset()` returned the
+   daemon to polling). That fallback is deleted: the bridge is the ONLY
+   event source, and it already ships `SCREEN 0|1` (+ snapshot replay on
+   connect) in `module/notifybridge.json` - nothing had to be added
+   there. With the bridge down nothing can feed the notification pool or
+   the charge band anyway, so the poll was pure dead weight: the daemon
+   now just keeps the last known screen state, and the reconnect replay
+   refreshes it.
+2. **`screen_on()` is now a pure cache read.** `screen_note()` (the NLS
+   `SCREEN` command) is the only writer; unknown before the first event
+   reports off (a notification shows), matching the old fallback
+   semantics. The `s_screen_evt` flag, `screen_event_driven()` and
+   `screen_source_reset()` are gone from `util.c`, `chgd.h` and `core.c`.
+3. **`notify_next_wake()` loses its 1s screen-off poll.** A parked top no
+   longer keeps a heartbeat alive on a lit screen: the `SCREEN 0` command
+   IS the edge that flashes the park, and the park is still bounded by
+   the grace window. The notify timer now arms only for a real cap
+   deadline or stays disarmed entirely. `queue_has_hold()` had no
+   consumers left and was removed.
+4. **Dead LED sysfs plumbing removed.** `write_sys()` and its `led_path()`
+   name matcher (`LEDS[] = {red,green,blue,lcd-backlight}`) had no
+   callers; they are deleted along with the `[led] trace_sysfs` key
+   (removed from `led.conf`, the GUI's LedConf.kt round-trip and the
+   README/comment story). The only remaining hardcoded device paths in the
+   daemon are the config/status/runtime paths under `/data/local/tmp` and
+   `/data/adb/modules/led_hal_root` (script-owned, not hardware).
+5. **The three tmp+rename status writers collapsed into one helper.**
+   `status_write()` (led_status), `nls_status_write()`
+   (notifybridge.status) and `charge_write()` (led_chg) used to open a
+   `*.tmp` file, write, close and rename by hand - the same pattern
+   triplicated with three `_TMP`/`_PATH` macro pairs. They now all call
+   a single `atomic_write(path, buf, len)` from util.c: full write to
+   `<path>.tmp` then rename, so a consumer read can never see a
+   half-written file. The `_TMP` macros and hand-rolled open/write/close
+   sequences are gone.
+6. Docs updated: README (screen transport, supervision, architecture),
+   module.prop version bumped to 3.3 / versionCode 23.
+
+## Revision: charge state from the bridge, sysfs poll gone (2026-09-22)
+
+1. **Charge is now event-driven end to end.** mods/charge.c no longer
+   reads `/sys/class/power_supply/battery/{status,capacity}` and carried
+   no `REGISTER_MODE` cadence; the `REGISTER_UEVENT("power_supply")` hook
+   is gone. The ONLY charge input is the bridge's `CHG` command:
+   NotifyBridge forwards `ACTION_BATTERY_CHANGED` as
+   `CHG <status> <level> [<plugged>]` (status word or raw BatteryManager
+   int 2..5, level 0..100, optional EXTRA_PLUGGED bit). The broadcast is
+   sticky, so a fresh receiver gets the current state immediately - the
+   same guarantee the old recheck provided, with zero polling.
+2. **The netlink uevent socket was removed from core.c.** The charge
+   hook was its only consumer; without it the `chgd_uevents` link section
+   stood empty, so `uev_dispatch()`, the socket fd and the
+   `#include <linux/netlink.h>` were deleted outright. select() now
+   watches the NLS sockets and the timerfd only.
+3. **`plugged` gate against a stuck "Charging" status.** This device's
+   BatteryService has been observed frozen at Charging/52% while no
+   charger is attached (sysfs said Discharging/76; no broadcast since the
+   unplug; system_server alive, no crash, no watchdog - `dumpsys battery
+   reset` revived it). The bridge sends EXTRA_PLUGGED; `plugged=0` forces
+   the band to "none", so a stale Charging can never light the LED.
+4. **`--once` no longer evaluates.** It reads and applies the persisted
+   band exactly as before, but there is no eval to run - CHG drives the
+   band at runtime, the state file only survives a restart. Boot with no
+   CHG yet = LEDs off.
+5. **Charge logging is transition-only.** The bridge re-emits its sticky
+   battery snapshot periodically (~30s); charge_note() now logs only
+   real transitions - status change, plug change, or zone crossing -
+   instead of an identical `Discharging 75% plug=0` line per re-emission.
+   Band/state-file writes and the LED fingerprint logic are unchanged.
+6. Docs updated: README (intro, charge event, wire format, architecture,
+   macro list) drops the uevent/60s-recheck story; module.prop describes
+   the charge band as bridge-driven with no sysfs reads and no polling.
+
 ## Revision: charge band recheck while charging (2026-09-20)
 
 1. **The LED could park on the wrong charge band for a whole charging

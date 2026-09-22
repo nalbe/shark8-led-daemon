@@ -3,8 +3,8 @@
  *
  * Reads /data/adb/modules/led_hal_root/led.conf at runtime and merges it
  * over the link-time registry (internal pseudo-packages only, e.g.
- * dialer's missed.call) so the user can tweak blacklists / colours /
- * timings WITHOUT recompiling.
+ * missed.call) so the user can tweak blacklists / colours / timings
+ * WITHOUT recompiling.
  *
  * SECTIONS:
  *   [suppress]  one package per line - never lights the LED
@@ -17,7 +17,7 @@
  *               notif_max_sec (0 = unlimited), default_color r,g,b for
  *               apps without a [rules] entry (per-app color = [rules])
  *   [ring]      incoming-call rainbow: max_sec + v3 color
- *   [voip]      messenger-call rainbow: max_sec / packages + v3 color
+ *   [voip]      messenger-call rainbow: max_sec + v3 color
  *
  * v3 per-event renderer sections (owned by led.c through the generic kv
  * table, one per event sec = charge|notify|missed|alarm|ring|voip):
@@ -26,7 +26,7 @@
  *   [sec.breath]   repeat, cur_r/cur_g/cur_b + rise/hold/fall/offt (owned
  *                  by the chip section itself)
  *   [sec.wave]     t0=r,g,b phase offsets, repeat + rise/hold/fall/offt
- *   [led]          chip/daemon globals only: logging, trace_sysfs,
+ *   [led]          chip/daemon globals only: logging, imax
  *                  imax
  *
  * Every other key=value pair anywhere in the file lands in a generic
@@ -45,7 +45,7 @@
  *   - suppress list = file [suppress] entries ONLY (runtime; no link-time
  *     blacklist anymore - suppress.c was removed)
  *   - rules        = file [rules] entries override the link-time registry,
- *     which carries ONLY internal pseudo-packages (dialer's missed.call)
+ *     which carries ONLY internal pseudo-packages (missed.call)
  *   - charge/notify colours come from the file, falling back to builtins
  *
  * All config text and this file are ASCII-only (no non-ASCII in artifacts).

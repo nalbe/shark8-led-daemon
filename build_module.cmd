@@ -7,7 +7,7 @@ rem  flashable KernelSU module zip into release\led_hal_root-v<ver>.zip
 rem  from exactly two sources:
 rem    led_hal_root\   daemon core only   (C sources, mods\, build.cmd)
 rem    module\         module packaging   (customize.sh, service.sh,
-rem                      module.prop, led.conf, META-INF, README.txt,
+rem                      module.prop, led.conf, META-INF,
 rem                      notifybridge-release.apk,
 rem                      led_gui-release.apk,
 rem                      awctl prebuilt)

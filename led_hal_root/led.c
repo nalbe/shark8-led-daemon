@@ -30,7 +30,7 @@
  * Timing (rise/hold/fall/offt) belongs to the chip section that
  * animates: [sec.breath] and [sec.wave] each carry their own keys.
  * No base-section timing, no fallback. The [led] section keeps only
- * chip/daemon globals: logging, trace_sysfs, imax.
+ * chip/daemon globals: logging, imax.
  *
  * No timer threads, no sysfs poking, no software animation - the
  * breathing, traveling-wave and solid modes all run inside the chip
@@ -218,8 +218,6 @@ void leds_all_off(void)
 const char *led_event(const char *sec, int r, int g, int b)
 {
     const char *mode = led_active_mode(sec);
-
-    LOGI("[led] %s mode=%s rgb=%d,%d,%d", sec, mode, r, g, b);
 
     if (!strcmp(mode, "off"))
         leds_all_off();

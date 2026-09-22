@@ -15,21 +15,20 @@ set "NLS=%~dp0..\android-notify-bridge"
 set "APK=%NLS%\app\build\outputs\apk\release\notifybridge-release.apk"
 set "DST=%~dp0module\notifybridge-release.apk"
 
-if not exist "%APK%" (
-    echo APK not built - building with gradle...
-    pushd "%NLS%"
-    where gradle >nul 2>nul
-    if errorlevel 1 (
-        call "D:\System\Apps\gradle-8.12\bin\gradle.bat" assembleRelease
-    ) else (
-        call gradle assembleRelease
-    )
-    set "RC=!ERRORLEVEL!"
-    popd
-    if not "!RC!"=="0" (
-        echo BUILD FAILED
-        exit /b 1
-    )
+rem Always rebuild so staged code is never stale on a rerun.
+echo Building notifybridge-release.apk...
+pushd "%NLS%"
+where gradle >nul 2>nul
+if errorlevel 1 (
+    call "D:\System\Apps\gradle-8.12\bin\gradle.bat" assembleRelease
+) else (
+    call gradle assembleRelease
+)
+set "RC=!ERRORLEVEL!"
+popd
+if not "!RC!"=="0" (
+    echo BUILD FAILED
+    exit /b 1
 )
 
 copy /y "%APK%" "%DST%" >nul

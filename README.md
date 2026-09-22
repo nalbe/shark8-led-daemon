@@ -3,10 +3,10 @@
 KernelSU module that drives the AW2033 RGB notification/charge LED on a
 rooted Blackview Shark 8 running a ported Pixel GSI ROM. A single
 event-driven daemon (`chgd`) programs the chip - no polling scripts exist
-outside of two short device-side boots, a bounded screen-state fallback,
-and the 60s charge-band recheck (see charge.c: this kernel fires a
-POWER_SUPPLY uevent only on plug/unplug, so a mid-charge threshold
-crossing would otherwise never repaint).
+outside of two short device-side boots and a bounded screen-state
+fallback. Even the charge band is event-driven: the bridge forwards the
+Android battery broadcast as a CHG command over the socket, so the daemon
+never reads /sys/class/power_supply and never rechecks on a timer.
 
 Both companion apps ship inside the flashable zip, but only one of them
 is this project's:
@@ -29,7 +29,7 @@ project ships (the chip driver and the `awctl` CLI are built there).
 led_hal_root/   daemon core only (C sources, mods/, build.cmd) -> chgd
 led_gui/        optional configurator app (com.bastet.ledgui)
 module/         module packaging: customize.sh, service.sh, module.prop,
-                led.conf, META-INF, README.txt, awctl prebuilt,
+                led.conf, META-INF, awctl prebuilt,
                 notifybridge-release.apk (from android-notify-bridge) + led_gui-release.apk
 release/        flashable zip output (led_hal_root-v<ver>.zip)
 aw2033-driver/  libaw2033.a + aw2033.h ONLY (prebuilt chip controller)
@@ -60,8 +60,8 @@ the live config file).
 ## The daemon
 
 Everything animates inside the AW2033 chip; chgd only programs registers.
-The kernel fires no uevent on backlight change, so screen state (and
-hence most wakeups) comes from the bridge over the socket - the daemon is
+Screen state (and hence most wakeups) comes only from the bridge over the
+socket - the daemon reads no sysfs and owns no screen polling; it is
 asleep in idle.
 
 ### Events and renderers
@@ -78,17 +78,21 @@ Events:
 
 - **charge** - three bands (lower/middle/upper), each with its own
   renderer, thresholds in `[charge]` (`first_threshold` /
-  `second_threshold`, order-free). Re-evaluated on `power_supply`
-  uevents (plug/unplug), on SIGALRM/inotify, and - because this kernel
-  silently tricks past capacity thresholds - on a 60s recheck that owns
-  the idle channel while the charger is live. The recheck repaints only
-  on a real band/color/mode change (fingerprint-gated) and dies the
-  moment the status leaves Charging/Full.
+  `second_threshold`, order-free). The band is evaluated from the
+  bridge's `CHG <status> <level> [<plugged>]` command - the broadcast
+  fires on every real status/level/plug change, so a threshold crossing
+  repaints immediately (no uevent gap, no recheck). It is re-rendered
+  on SIGALRM/inotify (config edit) from the last bridge state. The
+  optional plugged bit gates the band: `plugged=0` (broadcast says no
+  source is attached) forces "none", so a stuck/stale "Charging" status
+  can never light the LED while unplugged - this device's battery
+  service has been seen to stick at Charging.
 - **notification** - two presets: `[notify]` for apps without a rule,
   `[notify.app]` for apps that have a `[rules]` color entry
 - **ring** - SIM/dialer calls, incoming and outgoing
-- **voip** - messenger calls (Telegram/WhatsApp/Viber/Signal)
-- **missed** - missed-call LED
+- **voip** - messenger calls (any app the bridge classifies as a call
+  notification - category CALL / call channel; no hardcoded package list)
+- **missed** - missed-call LED (bridge event `MISSED_ON`/`MISSED_OFF`)
 - **alarm** - alarm clock LED
 
 Every one accepts any of the four renderers and its own color, timing,
@@ -128,8 +132,8 @@ edges (the bridge's screen event, a cancel, or a cap deadline):
 - **Cadence is reactive.** The core timer is armed to the next real
   deadline: exactly at the active entry's cap, a single `WATCHDOG_SEC`
   safety pass when there is no cap at all (`notif_max_sec=0`), and idle
-  with no pool work. A 1s sysfs poll survives only as a screen-state
-  fallback for when the bridge is down, bounded by the grace window.
+  with no pool work. There is no screen sysfs poll - screen state exists
+  only as the bridge's `SCREEN` events.
 
 ### Notification transport
 
@@ -152,13 +156,26 @@ RING_OFF              last SIM call notification
 VOIP_ON <pkg>         messenger call             -> voip plane
 VOIP_OFF <pkg>        messenger call notification gone
 SCREEN <0|1>          screen off/on              -> park flash / grace
+CHG <status> <level> [<plugged>]
+                      battery broadcast          -> charge band (only
+                      charge input; status word or raw BatteryManager
+                      int 2=Charging..5=Full, level 0..100, optional
+                      plugged bit, 0 forces the band off)
 PULSE <0|1>           notification_light_pulse changed by any writer
+                        (ONLY source of the toggle state - the daemon
+                        never reads Settings.* itself)
 ```
 
-On connect the client **replays its live state** (SCREEN, active
-RING/VOIP, every active ENQ), so a daemon restart mid-call re-arms
-cleanly. There is no logcat/event-log fallback - with the bridge absent,
-no notification-side LED can light. Charge bands, the light-pulse gate and
+On connect the client **replays its live state** (SCREEN, watched
+settings like PULSE, active RING/VOIP, every active ENQ), so a daemon
+restart mid-call re-arms cleanly and the blink-light toggle needs no
+local read: the bridge forwards its current polarity on connect the
+same way it does screen (and forwards every real change instantly).
+Battery state rides the broadcast the same way: the sticky
+ACTION_BATTERY_CHANGED delivers the current status/level/plugged on
+registration, so a daemon restart repaints the charge band too. There is
+no logcat/event-log fallback - with the bridge absent, no
+notification-side LED can light. Charge bands, the light-pulse gate and
 the test hooks are daemon-side and unaffected.
 
 ### System gates
@@ -168,8 +185,10 @@ the test hooks are daemon-side and unaffected.
   rainbows, alarms and charge are unaffected). The bridge watches
   `Settings.System` with a `ContentObserver` and pokes `PULSE 0` the
   moment any writer changes it, so a running notification LED goes off
-  instantly - no polling. `customize.sh` turns the toggle on for fresh
-  installs.
+  instantly - no polling. The pull side is pure state: `pulse_note()`
+  stores the NLS value (with the connect replay covering restarts) and
+  the next arming reads it - the daemon never forks a shell for this.
+  `customize.sh` turns the toggle on for fresh installs.
 
 ### Supervision
 
@@ -180,7 +199,6 @@ anywhere. If the daemon dies it stays down until reboot or a manual
 start (`service.sh`). `service.sh` only guarantees the daemon is up right
 after boot. No `WD` push, no `[led] watchdog_ms`, no root grant for the
 app.
-Set `trace_sysfs=1` in `[led]` for debug-only per-write sysfs tracing.
 
 ## LED GUI - optional configurator
 
@@ -276,7 +294,7 @@ kill -USR1 $(pidof chgd)   # fake Telegram notification (test mode, ignores scre
 kill -HUP  $(pidof chgd)   # test INCOMING call (renderer held until Disarm / [ring] max_sec)
 kill -WINCH $(pidof chgd)  # test OUTGOING call (same renderer, held)
 kill -QUIT  $(pidof chgd)  # cycle charge bands: lower -> middle -> upper -> none
-kill -USR2  $(pidof chgd)  # "Blink light" toggle OFF: invalidate pulse cache + disarm notify LED
+kill -USR2  $(pidof chgd)  # "Blink light" toggle OFF: note off-state + disarm notify LED
 kill -CONT  $(pidof chgd)  # truncate /data/local/tmp/ledd.log
 kill -ALRM  $(pidof chgd)  # force led.conf reload + re-apply visible state (GUI save); edits are also auto-detected via inotify
 ```
@@ -308,36 +326,41 @@ See [PATCHNOTES.md](PATCHNOTES.md) - kept to the daemon core and the GUI
 ## Architecture
 
 ```
-core.c    - main loop: select() over netlink uevents, the NLS client socket
-            and the adaptive one-shot timerfd; NLS command pipeline
-            (ENQ/CAN/CAN_ALL, RING_ON/OFF, VOIP_ON/OFF, PULSE);
-            signal test hooks; lockfile
+core.c    - main loop: select() over the NLS client socket (and its listen
+            socket) and the adaptive one-shot timerfd; NLS command pipeline
+            (ENQ/CAN/CAN_ALL, RING_ON/OFF, VOIP_ON/OFF, MISSED_ON/OFF,
+            SCREEN, CHG, PULSE); signal test hooks; lockfile
 led.c     - per-event renderer adapter: resolves [sec] mode=off|solid|breath|wave
             and programs the AW2033 chip through aw2033.h (the ONLY LED writer;
             all animation runs on-chip)
 config.c  - led.conf parser + generic key-value store for mods
-util.c    - logging, sysfs helpers, led_status + notifybridge.status files, screen
-            detection, notification_light_pulse gate
+util.c    - logging, file read helper, led_status + notifybridge.status
+            files, screen state cache (only the bridge's SCREEN events),
+            notification_light_pulse gate (only the bridge's PULSE events)
 
 mods/
   charge.c  - charge band eval ([charge] thresholds only) + per-band renderer
-              apply; idle repaint on power_supply uevents / refresh / the
-              60s charging recheck (the kernel uevent gap)
+              apply; driven by the bridge's CHG command (the ONLY charge
+              input - no sysfs reads), refresh repaints from the last CHG
+              on boot/SIGALRM; plugged=0 forces the band off
   queue.c   - notification priority pool: LIFO pick, screen-on Q_HOLD staging,
               preemption with resume-credit, lazy grace/expiry, cap accrue
   notify.c  - notification gate (suppress -> per-app color -> [notify]/
               [notify.app] renderer), owns the armed channel + pool heartbeat
-  ring.c    - SIM call mode (RING_ON/RING_OFF), [ring] renderer, missed-check
-              handover on call end
-  dialer.c  - call_log missed-call verification -> [missed] LED
-  tele.c    - child-process capture helpers (call_log query, settings get)
-  voip.c    - messenger call mode (VOIP_ON/VOIP_OFF), [voip] renderer, safety cap
+  ring.c    - SIM call mode (RING_ON/RING_OFF), [ring] renderer, missed
+              tombstone handover to the missed LED on call end
+  missed.c  - missed-call LED, driven purely by the bridge's
+              MISSED_ON/MISSED_OFF events (no call_log query, no
+              verification window)
+  voip.c    - messenger call mode (VOIP_ON/VOIP_OFF), [voip] renderer,
+              safety cap; which apps are calls is decided by the bridge
+              (category/channel), not by a package list
   alarm.c   - alarm clock LED, [alarm] renderer
 ```
 
 Adding a feature = a new file under `mods/`, no core edits. Extensions use
 `REGISTER_RULE` / `REGISTER_HANDLER` / `REGISTER_MODE` /
-`REGISTER_MODE_WAKE` / `REGISTER_UEVENT` / `REGISTER_REFRESH` macros that
+`REGISTER_MODE_WAKE` / `REGISTER_REFRESH` macros that
 place entries into linker sections. `config.c` is a generic key-value
 store: every unknown `[section] key=value` in led.conf is readable via
 `conf_get_str` / `conf_get_int`, so a mod owns its own config section

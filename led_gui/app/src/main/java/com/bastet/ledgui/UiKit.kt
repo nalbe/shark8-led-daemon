@@ -707,6 +707,11 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
     protected inner class RenderCard(title: String, hint: String = "", showColor: Boolean = false) : LinearLayout(context) {
         private val modeNames = listOf("off", "solid", "breath", "wave")
 
+        /** Chip timing cap: the AW2033 pattern register holds 4 bits per
+         *  time field (16 discrete codes, max 8300 ms), so GUI values
+         *  beyond this are clamped and later snapped to the nearest code. */
+        private val timeMax = 8300
+
         lateinit var mode: NamePicker
             private set
         var color: RgbPicker? = null
@@ -788,13 +793,13 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
                 brCur = TripleField("current (amps) r,g,b (0-15)", Triple(15, 15, 15))
                 addView(brCur)
                 addView(spacer(2))
-                brRise = numRow("rise (ms)", "500")
+                brRise = numRow("rise (ms, max $timeMax)", "500")
                 addView(spacer(2))
-                brHold = numRow("hold (ms)", "100")
+                brHold = numRow("hold (ms, max $timeMax)", "100")
                 addView(spacer(2))
-                brFall = numRow("fall (ms)", "500")
+                brFall = numRow("fall (ms, max $timeMax)", "500")
                 addView(spacer(2))
-                brOfft = numRow("off time (ms)", "1200")
+                brOfft = numRow("off time (ms, max $timeMax)", "1200")
             }
             waveCard = card {
                 addView(sectionTitle("Wave param"))
@@ -808,13 +813,13 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
                 addView(spacer(2))
                 waveSync = syncCheck("sync: all channels on master red PWM")
                 addView(spacer(2))
-                waveRise = numRow("rise (ms)", "500")
+                waveRise = numRow("rise (ms, max $timeMax)", "500")
                 addView(spacer(2))
-                waveHold = numRow("hold (ms)", "100")
+                waveHold = numRow("hold (ms, max $timeMax)", "100")
                 addView(spacer(2))
-                waveFall = numRow("fall (ms)", "500")
+                waveFall = numRow("fall (ms, max $timeMax)", "500")
                 addView(spacer(2))
-                waveOfft = numRow("off time (ms)", "1200")
+                waveOfft = numRow("off time (ms, max $timeMax)", "1200")
             }
             addView(solidCard)
             addView(breathCard)
@@ -907,17 +912,17 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
             r.solidCur = clampTriple(solidCur.getTriple(Triple(15, 15, 15)))
             r.brRepeat = brRepeat.getInt(0).coerceIn(0, 15)
             r.brCur = clampTriple(brCur.getTriple(Triple(15, 15, 15)))
-            r.brRise = brRise.getInt(500)
-            r.brHold = brHold.getInt(100)
-            r.brFall = brFall.getInt(500)
-            r.brOfft = brOfft.getInt(1200)
+            r.brRise = brRise.getInt(500).coerceIn(0, timeMax)
+            r.brHold = brHold.getInt(100).coerceIn(0, timeMax)
+            r.brFall = brFall.getInt(500).coerceIn(0, timeMax)
+            r.brOfft = brOfft.getInt(1200).coerceIn(0, timeMax)
             r.brSync = brSync.isChecked
             r.waveT0 = waveT0.getTriple(Triple(0, 1300, 2600))
             r.waveRepeat = waveRepeat.getInt(0).coerceIn(0, 15)
-            r.waveRise = waveRise.getInt(500)
-            r.waveHold = waveHold.getInt(100)
-            r.waveFall = waveFall.getInt(500)
-            r.waveOfft = waveOfft.getInt(1200)
+            r.waveRise = waveRise.getInt(500).coerceIn(0, timeMax)
+            r.waveHold = waveHold.getInt(100).coerceIn(0, timeMax)
+            r.waveFall = waveFall.getInt(500).coerceIn(0, timeMax)
+            r.waveOfft = waveOfft.getInt(1200).coerceIn(0, timeMax)
             r.waveSync = waveSync.isChecked
         }
 

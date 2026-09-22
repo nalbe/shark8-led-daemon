@@ -2,32 +2,29 @@
  * core.c - front door and event loop of the modular chgd daemon.
  *
  * Owns the transport and the registries, no policy:
- *   - main loop: select() over netlink uevents, NLS client socket,
- *     timerfd
- *   - netlink KOBJECT_UEVENT -> uev_dispatch(): every REGISTER_UEVENT
- *     hook whose match substring hits the raw message fires (charge
- *     owns "power_supply")
+ *   - main loop: select() over the NLS client socket (the only event
+ *     source), its listener, the adaptive timerfd and the config inotify
  *   - NLS socket "notify_bus": the NotificationListenerService bridge
- *     is the ONLY notification transport (no logdr/logcat anymore).
- *     ENQ/CAN/CAN_ALL feed the same pkg_dispatch pipeline; VOIP_ON/OFF,
- *     RING_ON/OFF arm the call rainbows directly.
+ *     is the ONLY event source. ENQ/CAN/CAN_ALL feed the pkg_dispatch
+ *     pipeline, VOIP_ON/OFF and RING_ON/OFF arm the call rainbows,
+ *     MISSED_ON/OFF drive the missed-call LED, SCREEN carries the
+ *     backlight polarity, CHG carries the charge state, PULSE carries
+ *     the notification-light toggle.
  *   - adaptive timerfd: retune_timer() picks the heartbeat of the mode
  *     that owns g_st.cur_pkg - ring owns "incoming.call", voip owns
- *     "voip.call", dialer/alarm/notify own theirs. notify owns "" only
+ *     "voip.call", missed/alarm/notify own theirs. notify owns "" only
  *     while the pool still has work; at true idle (empty pool + empty
  *     cur_pkg) no mode owns anything and the timer is disarmed - the
- *     charge band repaints via power_supply uevent or SIGALRM.
+ *     charge band repaints when a CHG arrives or SIGALRM fires.
  *     A mode with no deadline (next_wake_ms()==0, i.e. max_sec=0) keeps
  *     the timer DISARMED too: once its LED is up, nothing runs and the
  *     phone sleeps until the next event (cancel, RING_OFF, VOIP_OFF).
- *     Dialer's missed-call verification window wins over idle while
- *     pending
  *   - signal test hooks and watchdog / lockfile housekeeping
  *
- * All policy lives in mods/: charge.c, notify.c, ring.c, dialer.c.
+ * All policy lives in mods/: charge.c, notify.c, ring.c, missed.c.
  * The core only walks the registry sections and calls shared services
- * declared in chgd.h (pkg_dispatch, uev_dispatch, refresh_dispatch,
- * retune_timer). No LED, no band, no arming here.
+ * declared in chgd.h (pkg_dispatch, refresh_dispatch, retune_timer).
+ * No LED, no band, no arming here.
  */
 
 #include <stdio.h>
@@ -45,7 +42,6 @@
 #include <sys/timerfd.h>
 #include <sys/wait.h>
 #include <poll.h>
-#include <linux/netlink.h>
 #include "chgd.h"
 
 #define STATE_PATH "/data/local/tmp/led_chg"
@@ -79,7 +75,7 @@ const struct led_mode *mode_owns(const char *pkg)
     return NULL;
 }
 
-/* exact-match claiming handlers first (dialer), then the "*" default
+/* exact-match claiming handlers (alarm) first, then the "*" default
  * handler (notify's suppress/screen/dedup/arm pipeline). */
 int pkg_dispatch(struct notif_state *st, const char *pkg, int id)
 {
@@ -94,15 +90,6 @@ int pkg_dispatch(struct notif_state *st, const char *pkg, int id)
         if (!strcmp(h->pkg, "*") && h->fn(pkg, id))
             return 1;
     return 0;
-}
-
-/* netlink KOBJECT_UEVENT consumers: charge ("power_supply"). */
-void uev_dispatch(const char *msg)
-{
-    const struct uevent_hook *h;
-    for (h = __start_chgd_uevents; h < __stop_chgd_uevents; h++)
-        if (strstr(msg, h->match))
-            h->fn();
 }
 
 /* notification_cancel dispatch: drop the cancelled notification from the
@@ -158,6 +145,10 @@ void notif_cancel_all(const char *pkg)
  *   RING_ON <0|1>       SIM call notification posted (1 incoming, 0
  *                       outgoing/ongoing)
  *   RING_OFF            last SIM call notification removed
+ *   MISSED_ON <id>      dialer missed-call tombstone posted
+ *   MISSED_OFF <id>     dialer missed-call tombstone removed; the bridge
+ *                       is the classification source (channel
+ *                       "missed_calls"), so no call_log query anywhere
  *   PULSE <0|1>         Settings.System notification_light_pulse changed
  *                       by ANY writer (observer in NLS): 0 disarms the
  *                       notification LED right away like stock SystemUI,
@@ -168,10 +159,21 @@ void notif_cancel_all(const char *pkg)
  *                       this edge is what lets a parked notification
  *                       flash with zero polling; on connect the app
  *                       replays the current state.
+ *   CHG <status> <level> [<plugged>]
+ *                       battery status forwarded from
+ *                       ACTION_BATTERY_CHANGED: status is a raw
+ *                       BatteryManager constant (2=Charging, 3=Discharging,
+ *                       4=Not charging, 5=Full) or a word, level is the
+ *                       0..100 capacity, and the optional plugged bit is
+ *                       BatteryManager.EXTRA_PLUGGED (0 = physically
+ *                       unplugged; the daemon then never lights the charge
+ *                       LED, guarding against a stuck "Charging" status).
+ *                       The ONLY charge input: the daemon never reads
+ *                       /sys/class/power_supply itself.
  * Only one client at a time; a new connect replaces the old one. This is
  * the ONLY notification transport: there is no logdr/logcat fallback. On
- * connect the client replays its live state (RING/VOIP + every ENQ) so a
- * daemon restart mid-call re-arms cleanly.
+ * connect the client replays its live state (RING/VOIP/MISSED + every
+ * ENQ + SCREEN/PULSE) so a daemon restart mid-call re-arms cleanly.
  */
 
 static int nls_listen(void)
@@ -216,7 +218,8 @@ static void nls_cmd(const char *s)
     /* Call detection is event-driven from the NLS bridge: it classifies
      * the SIM/dialer notification and posts RING_ON on the live call
      * (incoming=1 / outgoing=0), RING_OFF when the last call notification
-     * is gone; messenger calls use VOIP_ON/VOIP_OFF the same way. No
+     * is gone, MISSED_ON/MISSED_OFF for the missed-call tombstone;
+     * messenger calls use VOIP_ON/VOIP_OFF the same way. No
      * telephony/dumpsys polling anywhere in this path. */
     if (!strcmp(s, "VOIP_ON")  || !strncmp(s, "VOIP_ON ",  8))  { voip_on();  return; }
     if (!strcmp(s, "VOIP_OFF") || !strncmp(s, "VOIP_OFF ", 9)) { voip_off(); return; }
@@ -229,17 +232,25 @@ static void nls_cmd(const char *s)
         ring_off();
         return;
     }
+    /* Missed-call LED: the bridge classifies the dialer's tombstone
+     * (channel "missed_calls") and emits the MISSED edge - the exact
+     * opening/closing of the notification IS the event, no call_log
+     * verification window, no content query, no telephony reads. */
+    if (!strncmp(s, "MISSED_ON", 9))  { missed_on();  return; }
+    if (!strncmp(s, "MISSED_OFF", 10)){ missed_off(); return; }
     /* The system "Notification light" toggle (Settings.System
      * notification_light_pulse) changed - the NLS ContentObserver caught
      * SOME writer (Settings app, adb, the GUI) and forwarded the fresh
-     * value. 0 = stock SystemUI semantics: drop the cache AND disarm the
-     * notification LED that might be showing right now. 1 = just invalidate
-     * the 3s cache so the next arm re-reads. No polling anywhere. */
+     * value. 0 = stock SystemUI semantics: disarm the notification LED
+     * that might be showing right now, no backlog kept. 1 = just note
+     * the new state; the next arm gates on it. PULSE state is stored by
+     * pulse_note() and replayed by the bridge on connect like SCREEN,
+     * so the daemon itself never reads settings. No polling anywhere. */
     if (!strncmp(s, "PULSE ", 6)) {
         int on = (s[6] == '1' && (s[7] == '\0' || s[7] == '\n'));
         if (!on && !(s[6] == '0' && (s[7] == '\0' || s[7] == '\n')))
             return;             /* malformed: ignore the line */
-        light_pulse_invalidate();
+        pulse_note(on);
         if (!on) {
             queue_clear();                      /* toggle off: no backlog */
             disarm_notification(&g_st, "pulse-off");
@@ -257,6 +268,13 @@ static void nls_cmd(const char *s)
             queue_arbitrate();
             retune_timer();
         }
+        return;
+    }
+    /* Charge state: the bridge watches the battery broadcasts and forwards
+     * the parsed extras as CHG <status> <level> - the ONLY charge input,
+     * no sysfs reads, no polling anywhere. */
+    if (!strncmp(s, "CHG ", 4)) {
+        charge_note(s + 4);
         return;
     }
     /* Notification lifecycle: ENQ/CAN/CAN_ALL share the same
@@ -296,9 +314,9 @@ static void nls_read(void)
         g_nls = -1;
         g_nls_len = 0;
         nls_status_write(0);
-        /* no event source anymore: fall back to polling the backlight so a
-         * parked notification still flashes on the next screen-off. */
-        screen_source_reset();
+        /* No event source anymore - nothing can feed the pool or the
+         * charge band, so the daemon sleeps. The last screen state stays
+         * cached; the bridge replays SCREEN on reconnect. */
         retune_timer();
         return;
     }
@@ -329,7 +347,6 @@ void refresh_dispatch(void)
 
 /* One timerfd serves all pending timeouts; it is re-armed on every state
  * transition instead of ticking blindly every 30s:
- *   dialer verification window open  -> 2s missed-call recheck
  *   mode owns cur_pkg               -> its heartbeat (notify 1s while a
  *                                      top parks, ring 1s, ...)
  *   mode with a next_wake deadline  -> one-shot until that deadline
@@ -346,39 +363,36 @@ void retune_timer(void)
     const char *why;
     long ms;
     int one_shot = 0;
-    if (g_call_checks_left > 0)              { ms = CALL_RECHECK_MS;   why = "call check"; }
-    else {
-        const struct led_mode *m = mode_owns(g_st.cur_pkg);
-        if (m) {
-            why = m->label ? m->label() : m->name;
-            if (m->next_wake_ms) {
-                long w = m->next_wake_ms();
-                if (w > 0) {
-                    ms = w;              /* sleep exactly until the deadline */
-                } else {
-                    /* 0 = no deadline at all (permanent LED, disarm is
-                     * purely event-driven): disarm the timer completely.
-                     * After the LED is armed there is nothing time-bound
-                     * left, so no wakeup at all and the phone sleeps. The
-                     * old fallback to WATCHDOG_SEC re-armed a one-shot on
-                     * every tick - an eternal wake every 5 minutes while a
-                     * no-cap LED idled, and its tick was a no-op anyway. */
-                    ms = 0;
-                    why = "event-driven";
-                }
-                if (ms > 0) one_shot = 1;    /* re-armed after each tick */
+    const struct led_mode *m = mode_owns(g_st.cur_pkg);
+    if (m) {
+        why = m->label ? m->label() : m->name;
+        if (m->next_wake_ms) {
+            long w = m->next_wake_ms();
+            if (w > 0) {
+                ms = w;              /* sleep exactly until the deadline */
             } else {
-                ms = m->tick_ms;         /* plain periodic heartbeat */
+                /* 0 = no deadline at all (permanent LED, disarm is
+                 * purely event-driven): disarm the timer completely.
+                 * After the LED is armed there is nothing time-bound
+                 * left, so no wakeup at all and the phone sleeps. The
+                 * old fallback to WATCHDOG_SEC re-armed a one-shot on
+                 * every tick - an eternal wake every 5 minutes while a
+                 * no-cap LED idled, and its tick was a no-op anyway. */
+                ms = 0;
+                why = "event-driven";
             }
-        } else if (g_st.cur_pkg[0])          { ms = WATCHDOG_SEC*1000L; why = "watchdog"; }
-        else {
-            /* true idle: nothing owns the LED. No heartbeat at all -
-             * a charge band change repaints via power_supply uevent or
-             * SIGALRM (led.conf edit), a new notification arms the timer
-             * itself. A stale 300s tick here was pure noise. */
-            ms = 0;
-            why = "idle";
+            if (ms > 0) one_shot = 1;    /* re-armed after each tick */
+        } else {
+            ms = m->tick_ms;         /* plain periodic heartbeat */
         }
+    } else if (g_st.cur_pkg[0])          { ms = WATCHDOG_SEC*1000L; why = "watchdog"; }
+    else {
+        /* true idle: nothing owns the LED. No heartbeat at all -
+         * a charge band change repaints when CHG arrives (bridge)
+         * or SIGALRM (led.conf edit), a new notification arms the
+         * timer itself. A stale 300s tick here was pure noise. */
+        ms = 0;
+        why = "idle";
     }
     struct itimerspec its;
     memset(&its, 0, sizeof(its));
@@ -405,7 +419,7 @@ void retune_timer(void)
             return;
         /* a periodic policy already running at the SAME period keeps its
          * phase: restarting the countdown from zero on every unrelated
-         * retune (screen toggle, NLS connect/cancel, uevent) shifts the
+         * retune (screen toggle, NLS connect/cancel) shifts the
          * tick grid, so a fixed cadence like the charge recheck looks
          * coupled to whatever event retuned last. One-shots (cap expiry,
          * adaptive deadlines) still re-arm from zero - a full window from
@@ -430,6 +444,7 @@ static volatile sig_atomic_t g_fake_dial   = 0;
 static volatile sig_atomic_t g_fake_voip   = 0;
 static volatile sig_atomic_t g_fake_alarm  = 0;
 static volatile sig_atomic_t g_fake_charge = 0;
+static volatile sig_atomic_t g_fake_missed = 0;
 static volatile sig_atomic_t g_clear       = 0;
 static volatile sig_atomic_t g_clear_log   = 0;
 static volatile sig_atomic_t g_conf_reload = 0;
@@ -440,6 +455,7 @@ static void on_hup  (int s){ (void)s; g_fake_dial = 1; }
 static void on_winch(int s){ (void)s; g_fake_voip = 1; }
 static void on_tstp (int s){ (void)s; g_fake_alarm = 1; }
 static void on_quit (int s){ (void)s; g_fake_charge = 1; }
+static void on_pwr  (int s){ (void)s; g_fake_missed = 1; }
 static void on_cont (int s){ (void)s; g_clear_log = 1; }
 static void on_alrm(int s)
 {
@@ -483,7 +499,8 @@ int main(int argc, char **argv)
     }
 
     if (once) {
-        eval_and_write();           /* mods/charge.c: band -> state file */
+        /* one-shot dump of the persisted band; the charge state itself
+         * only ever comes from the bridge's CHG command at runtime */
         char buf[64] = "";
         read_line(STATE_PATH, buf, sizeof(buf));
         fputs(buf, stdout);
@@ -505,21 +522,9 @@ int main(int argc, char **argv)
     install_handler(SIGWINCH, on_winch);
     install_handler(SIGTSTP, on_tstp);
     install_handler(SIGQUIT, on_quit);
+    install_handler(SIGPWR,  on_pwr);
     install_handler(SIGCONT, on_cont);
     install_handler(SIGALRM, on_alrm);
-
-    int nl = socket(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
-    if (nl < 0) { perror("socket"); return 1; }
-    struct sockaddr_nl sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.nl_family = AF_NETLINK;
-    sa.nl_groups = 1;
-    if (bind(nl, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-        perror("bind netlink");
-        return 1;
-    }
-    /* never let a spurious readiness block us */
-    fcntl(nl, F_SETFL, fcntl(nl, F_GETFL, 0) | O_NONBLOCK);
 
     int tfd = timerfd_create(CLOCK_MONOTONIC, 0);
     if (tfd < 0) { perror("timerfd"); return 1; }
@@ -544,8 +549,7 @@ int main(int argc, char **argv)
     if (g_cfg < 0)
         LOGI("conf: inotify unavailable (%s), stat fallback", strerror(errno));
 
-    static unsigned char buf[16384];
-    LOGI("chgd running (nl=%d tfd=%d nls=%d cfg=%d)", nl, tfd, g_nls_l, g_cfg);
+    LOGI("chgd running (tfd=%d nls=%d cfg=%d)", tfd, g_nls_l, g_cfg);
     retune_timer();
 
     for (;;) {
@@ -585,6 +589,12 @@ int main(int argc, char **argv)
              * cycle state lives in charge.c, no pre-disarm here */
             charge_test_next();
         }
+        if (g_fake_missed) {
+            g_fake_missed = 0;
+            /* test missed call: same path as the bridge's MISSED_ON event */
+            test_disarm("test switch");
+            missed_on();
+        }
         if (g_clear_log) {
             g_clear_log = 0;
             FILE *lf = fopen("/data/local/tmp/ledd.log", "w");
@@ -593,10 +603,11 @@ int main(int argc, char **argv)
         }
         if (g_clear) {
             g_clear = 0;
-            /* GUI flipped the "Notification light" toggle OFF: drop the
-             * cached settings value so the next arm reads the fresh one,
-             * and kill whatever notification LED is showing right now. */
-            light_pulse_invalidate();
+            /* GUI flipped the "Notification light" toggle OFF: it tells us
+             * directly (belt-and-braces - the NLS ContentObserver will
+             * forward the same flip as PULSE 0 over the socket), so note
+             * the state and kill whatever notification LED is showing. */
+            pulse_note(0);
             queue_clear();
             disarm_notification(&g_st, "sigusr2");
         }
@@ -615,14 +626,13 @@ int main(int argc, char **argv)
             }
         }
 
-        int maxfd = nl > tfd ? nl : tfd;
+        int maxfd = tfd;
         if (g_nls_l > maxfd) maxfd = g_nls_l;
         if (g_nls > maxfd) maxfd = g_nls;
         if (g_cfg > maxfd) maxfd = g_cfg;
 
         fd_set rfds;
         FD_ZERO(&rfds);
-        FD_SET(nl, &rfds);
         FD_SET(tfd, &rfds);
         if (g_nls_l >= 0) FD_SET(g_nls_l, &rfds);
         if (g_nls >= 0) FD_SET(g_nls, &rfds);
@@ -635,16 +645,6 @@ int main(int argc, char **argv)
             break;
         }
         if (rc == 0) continue;
-
-        /* --- kernel uevents: drain everything queued --- */
-        if (FD_ISSET(nl, &rfds)) {
-            for (;;) {
-                ssize_t n = recv(nl, buf, sizeof(buf) - 1, MSG_DONTWAIT);
-                if (n <= 0) break;
-                buf[n] = '\0';
-                uev_dispatch((char *)buf);
-            }
-        }
 
         /* --- led.conf edited by ANY writer: reload this loop turn --- */
         if (g_cfg >= 0 && FD_ISSET(g_cfg, &rfds)) {
@@ -662,9 +662,6 @@ int main(int argc, char **argv)
         if (FD_ISSET(tfd, &rfds)) {
             uint64_t exp;
             ssize_t ig = read(tfd, &exp, sizeof(exp)); (void)ig;
-
-            /* dialer verification window: no-op when closed */
-            maybe_call_check();
 
             /* the mode that owns cur_pkg does the policy tick */
             const struct led_mode *m = mode_owns(g_st.cur_pkg);

@@ -1,25 +1,63 @@
 {
-  "_comment": "notifybridge config shipped with the led_hal_root module. Deployed to /data/local/tmp/notifybridge.json by customize.sh (module install) and install_core.cmd (dev apply). watchedSettings = the 'Blink light' gate: any writer to Settings.System.notification_light_pulse is forwarded to the daemon as PULSE 0/1 instantly.",
-  "dialerPkg": "com.google.android.dialer",
-  "voipPkgs": ["org.telegram.messenger", "com.whatsapp", "com.viber.voip", "org.thoughtcrime.securesms", "com.snapchat", "com.google.android.apps.tachyon"],
+  "_comment": "notifybridge config shipped with the led_hal_root module. Deployed to /data/local/tmp/notifybridge.json by customize.sh (module install) and install_core.cmd (dev apply). Sections: notifications (out for ENQ/CAN/RING/VOIP/MISSED; the dialer package is fully classified by the bridge - live calls as RING, missed tombstones as MISSED - and never emitted as a raw ENQ), broadcasts (screen polarity + snapshot replay + battery charge state), settings (the 'Blink light' gate: Settings.System.notification_light_pulse forwarded as PULSE 0/1 instantly, current polarity replayed to every socket on connect like screen). Wire contract to the daemon: ENQ/CAN/RING_ON/OFF/VOIP_ON/OFF/MISSED_ON/OFF/SCREEN 0|1/CHG <status> <level>/PULSE 0|1.",
   "sinks": [
     { "type": "socket", "name": "notify_bus" },
     { "type": "logcat", "name": "log" }
   ],
-  "rules": [
-    { "event": "notify", "action": "posted",  "pkg": "*", "to": "notify_bus", "line": "ENQ $pkg $id" },
-    { "event": "notify", "action": "removed", "pkg": "*", "to": "notify_bus", "line": "CAN $pkg $id" },
-    { "event": "ring",   "action": "on",      "pkg": "*", "to": "notify_bus", "line": "RING_ON $incoming" },
-    { "event": "ring",   "action": "off",     "pkg": "*", "to": "notify_bus", "line": "RING_OFF" },
-    { "event": "voip",   "action": "on",      "pkg": "*", "to": "notify_bus", "line": "VOIP_ON $pkg" },
-    { "event": "voip",   "action": "off",     "pkg": "*", "to": "notify_bus", "line": "VOIP_OFF $pkg" },
-    { "event": "screen", "action": "on",      "pkg": "*", "to": "notify_bus", "line": "SCREEN 1" },
-    { "event": "screen", "action": "off",     "pkg": "*", "to": "notify_bus", "line": "SCREEN 0" },
-    { "event": "pulse",  "action": "on",      "pkg": "*", "to": "notify_bus", "line": "PULSE 1" },
-    { "event": "pulse",  "action": "off",     "pkg": "*", "to": "notify_bus", "line": "PULSE 0" }
+  "logAll": false,
+  "reload": true,
+
+  "notifications": {
+    "enabled": true,
+    "calls": {
+      "dialer": "com.google.android.dialer",
+      "voip": ["org.telegram.messenger", "com.whatsapp", "com.viber.voip", "org.thoughtcrime.securesms", "com.snapchat", "com.google.android.apps.tachyon"]
+    },
+    "out": [
+      { "when": "notify.posted", "to": "notify_bus", "line": "ENQ $pkg $id" },
+      { "when": "notify.removed", "to": "notify_bus", "line": "CAN $pkg $id" },
+      { "when": "ring.on", "to": "notify_bus", "line": "RING_ON $incoming" },
+      { "when": "ring.off", "to": "notify_bus", "line": "RING_OFF" },
+      { "when": "voip.on", "to": "notify_bus", "line": "VOIP_ON $pkg" },
+      { "when": "voip.off", "to": "notify_bus", "line": "VOIP_OFF $pkg" },
+      { "when": "missed.on", "to": "notify_bus", "line": "MISSED_ON $id" },
+      { "when": "missed.off", "to": "notify_bus", "line": "MISSED_OFF $id" }
+    ]
+  },
+
+  "broadcasts": [
+    {
+      "_comment": "SCREEN keeps the pre-hardcode behavior alive: polarity gives a real $on bit, snapshot re-emits the current screen state on socket connect (replacement for the old built-in replay).",
+      "action": "android.intent.action.SCREEN_OFF",
+      "event": "screen",
+      "polarity": "off",
+      "snapshot": true,
+      "out": [ { "when": "*", "to": "notify_bus", "line": "SCREEN $on" } ]
+    },
+    {
+      "action": "android.intent.action.SCREEN_ON",
+      "event": "screen",
+      "polarity": "on",
+      "snapshot": true,
+      "out": [ { "when": "*", "to": "notify_bus", "line": "SCREEN $on" } ]
+    },
+    {
+      "_comment": "BATTERY_CHANGED carries the whole charge state (level + status + plugged) and fires on every real step: capacity change while charging, plug/unplug transitions. Routed to the daemon as CHG <status> <level> <plugged> - the daemon reads NOTHING from sysfs and owns no polling. No snapshot here: registering the receiver delivers the current sticky state by itself, and the reconnect replay would only emit an un-substituted template line.",
+      "action": "android.intent.action.BATTERY_CHANGED",
+      "event": "battery",
+      "fields": { "level": "level", "status": "status", "plugged": "plugged" },
+      "out": [ { "when": "*", "to": "notify_bus", "line": "CHG $status $level $plugged" } ]
+    }
   ],
-  "watchedSettings": [
-    { "table": "system", "name": "notification_light_pulse", "event": "pulse", "defaultOn": true }
-  ],
-  "logAll": false
+
+  "settings": [
+    {
+      "_comment": "Blink light gate: forward Settings.System.notification_light_pulse changes to the daemon as PULSE 0/1.",
+      "table": "system",
+      "name": "notification_light_pulse",
+      "event": "pulse",
+      "defaultOn": true,
+      "out": [ { "when": "*", "to": "notify_bus", "line": "PULSE $on" } ]
+    }
+  ]
 }

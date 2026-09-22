@@ -1,30 +1,37 @@
 /*
  * mods/charge.c - charge band evaluation and LED application.
  *
- * Evaluates and applies the charge band PURELY on events - there is no
- * idle heartbeat: at true idle the core disarms the timer and the band
- * repaints only when a power_supply uevent arrives or led.conf is edited
- * (SIGALRM refresh). Registered two ways:
-*     REGISTER_REFRESH   boot + SIGALRM (led.conf edited): re-evaluate
- *     REGISTER_UEVENT    "power_supply" uevents: same re-evaluation. NOTE:
- *                        on this kernel the POWER_SUPPLY uevent fires only
- *                        on plug/unplug - a mid-charge capacity trickle
- *                        past a threshold (lower -> middle -> upper)
- *                        broadcasts nothing.
- *     REGISTER_MODE      "charge" owns the idle channel ("") while the
- *                        charger is live: a 60s recheck re-evaluates the
- *                        band and repaints only on a real change
- *                        (fingerprint-gated, no LED blip). The kernel gap
- *                        is the recheck's only job and the cadence dies
- *                        the moment the status leaves charging.
- *                        queue_has_pending() / queue_active() defer "" to
- *                        the notification pool, so a parked or showing
- *                        notification never competes with the recheck.
- *     SIGQUIT charge test: holds the channel via cur_pkg, no mode/timer
- * The band is recomputed on battery uevents and written to the state
- * file; the LEDs are rewritten only on real state changes
- * (g_applied_band fingerprint: band + colors + mode).
-
+ * Purely event-driven, exactly like the notification pipeline: the charge
+ * state arrives as a CHG command on the NLS socket (the bridge watches
+ * ACTION_BATTERY_CHANGED / ACTION_POWER_CONNECTED / ACTION_POWER_DISCONNECTED
+ * and pokes us on every real level/status change). There is NO sysfs read
+ * anywhere in the daemon - /sys/class/power_supply is never touched - and
+ * no polling cadence: the android battery broadcast fires on every capacity
+ * step, so the old 60s threshold-recheck mode is gone along with the
+ * power_supply uevent hook.
+ *
+ *   CHG <status> <level> [<plugged>]
+ *                          the bridge's parse of the battery broadcast:
+ *                          status is the raw BatteryManager constant
+ *                          (2=Charging, 3=Discharging, 4=Not charging,
+ *                          5=Full) or a ready-made word ("Not charging"
+ *                          arrives as two tokens); level is 0..100; the
+ *                          optional trailing plugged bit (BatteryManager
+ *                          EXTRA_PLUGGED) gates the band: plugged=0 means
+ *                          the broadcast itself says no source is attached,
+ *                          so a stale "Charging" status can never light the
+ *                          charge LED (this device's battery service has
+ *                          been seen to stick at Charging while unplugged).
+ *   REGISTER_REFRESH       boot + SIGALRM (led.conf edited): re-render the
+ *                          band from the last bridge state so a threshold
+ *                          or color edit repaints; no data yet -> off.
+ *   SIGQUIT charge test    holds the channel via cur_pkg, no mode/timer
+ * The band is recomputed on every CHG and written to the state file; the
+ * LEDs are rewritten only on a real change (g_applied_band fingerprint:
+ * band + colors + mode). The log is transition-only too: status/plug
+ * changes and zone crossings are logged, the bridge's periodic sticky
+ * re-emissions are not.
+ *
  * Config ownership: [charge] carries ONLY the thresholds. Every band
  * owns its full renderer: [charge.lower|middle|upper] mode= + color=
  * and the [charge.<band>.solid/breath/wave] chip sections (each chip
@@ -32,7 +39,7 @@
  *
  * Nothing here needs the core to know about it; the core only walks
  * the registries. Owners are mutually exclusive: "" -> notify while
- * the pool has work (charges repaint on uevent/SIGALRM), armed package
+ * the pool has work (charges repaint on CHG/SIGALRM), armed package
  * -> notify, "incoming.call" -> ring.
  */
 
@@ -41,11 +48,9 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include "../chgd.h"
 
 #define STATE_PATH "/data/local/tmp/led_chg"
-#define STATE_TMP  "/data/local/tmp/led_chg.tmp"
 
 /* charge thresholds defaults live in config.c ([charge] section of
  * led.conf). Builtin fallbacks are defined there too. Band colors and
@@ -65,30 +70,27 @@
 #define DEF_UPPER_B 0
 
 /* last applied charge state: band + color + mode.
- * Rewritten only on a real change, otherwise every tick/uevent would
- * blink the LED off->on. Invalidation: arm_notification / arm_ring set
- * the first byte to NUL, forcing a reapply on the next charge pass. */
+ * Rewritten only on a real change, otherwise every CHG would blink the
+ * LED off->on. Invalidation: arm_notification / arm_ring set the first
+ * byte to NUL, forcing a reapply on the next charge pass. */
 char g_applied_band[64] = "\x01INIT";
 
-/* Charge recheck cadence. This kernel's POWER_SUPPLY uevent fires only
- * on plug/unplug; a capacity crossing mid-charge is silent. While the
- * charger is live and nobody else owns the idle channel, one 60s tick
- * re-evaluates the band (two sysfs reads; the g_applied_band fingerprint
- * keeps the repaint silent until the band actually changes). The mode
- * owns "" only while charging/full AND the notification pool is empty. */
-#define CHARGE_RECHECK_MS 60000L
+/* last charge state reported by the bridge (CHG command). No sysfs, no
+ * kernel reads: this is the ONLY charge input the daemon has. */
+static char g_chg_status[24] = "";   /* status word, "" = no data yet */
+static int  g_chg_level      = -1;   /* capacity percent, -1 = none   */
+static int  g_chg_plugged    = -1;   /* plugged bit, -1 = not reported */
 
-static int g_charge_live;    /* 1 = status Charging/Full at last eval */
+/* last state that actually reached the log. The bridge re-emits its
+ * sticky battery snapshot periodically (every 30s or so); a repeat of
+ * the same status/level/plugged/band must stay silent. Only charging
+ * started/stopped, zone crossings and plug toggles are noteworthy. */
+static char g_log_status[24]  = "";
+static int  g_log_plugged     = -1;
+static char g_log_band[16]    = "";
 
-static const char *band_for(const char *status, const char *cap)
+static const char *band_for(const char *status, int level)
 {
-    int c = -1;
-    if (cap && *cap) {
-        c = atoi(cap);
-        for (const char *p = cap; *p; p++)
-            if (*p < '0' || *p > '9') { c = -1; break; }
-    }
-
     /* range names are abstract (lower/middle/upper); the actual colors
      * and light types per range come from led.conf, not hardcoded */
     if (!strcmp(status, "Full"))
@@ -97,40 +99,117 @@ static const char *band_for(const char *status, const char *cap)
     if (!strcmp(status, "Charging")) {
         int second = conf_second_threshold();
         int first = conf_first_threshold();
-        if (c >= second) return "upper";
-        if (c >= first) return "middle";
+        if (level >= second) return "upper";
+        if (level >= first) return "middle";
         return "lower";
     }
 
     if (!strcmp(status, "Not charging"))
-        return (c >= conf_second_threshold()) ? "upper" : "none";
+        return (level >= conf_second_threshold()) ? "upper" : "none";
 
-    return "none";
+    return "none";      /* Discharging / Unknown / no data */
 }
 
-long eval_and_write(void)
+/* persist the current band to the state file (GUI reads it), atomic
+ * write via the shared helper (tmp + rename) */
+static void charge_write(const char *band)
 {
-    char status[64] = "", cap[16] = "";
-    read_line("/sys/class/power_supply/battery/status", status, sizeof(status));
-    read_line("/sys/class/power_supply/battery/capacity", cap, sizeof(cap));
-
-    /* mark whether the charge recheck cadence should stay armed: plugged
-     * and charging/full only. Discharging / Not charging -> cadence off. */
-    g_charge_live = (!strcmp(status, "Charging") || !strcmp(status, "Full")) ? 1 : 0;
-
-    const char *band = band_for(status, cap);
     long ts = (long)time(NULL);
 
     char buf[64];
     int len = snprintf(buf, sizeof(buf), "%s %ld\n", band, ts);
 
-    int fd = open(STATE_TMP, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd >= 0) {
-        ssize_t ig = write(fd, buf, (size_t)len); (void)ig;
-        close(fd);
-        rename(STATE_TMP, STATE_PATH);
+    atomic_write(STATE_PATH, buf, (size_t)len);
+}
+
+/* Normalize the bridge's BatteryManager status: a raw int constant or a
+ * word (both spellings the config may emit). Unknown stays a no-band. */
+static const char *status_word(const char *tok)
+{
+    if (tok[0] >= '0' && tok[0] <= '9') {
+        switch (atoi(tok)) {
+        case 2: return "Charging";
+        case 3: return "Discharging";
+        case 4: return "Not charging";
+        case 5: return "Full";
+        default: return "Unknown";
+        }
     }
-    return ts;
+    return tok;
+}
+
+static void apply_band(const char *band_in);   /* defined below */
+
+/* charge note from the NLS bridge: "CHG <status> <level> [<plugged>]".
+ * Tokenized defensively: every non-numeric token builds the status word
+ * ("Not charging" is two tokens), a leading 1..5 int is a raw
+ * BatteryManager status, the next numeric token is the level and an
+ * optional trailing numeric token is the plugged bit. */
+void charge_note(const char *s)
+{
+    char status[32] = "";
+    int level = -1;
+    int plugged = -1;
+
+    while (*s) {
+        while (*s == ' ' || *s == '\t') s++;
+        if (!*s) break;
+        char tok[24];
+        size_t n = 0;
+        while (s[n] && s[n] != ' ' && s[n] != '\t' && s[n] != '\n' &&
+               n < sizeof(tok) - 1) {
+            tok[n] = s[n];
+            n++;
+        }
+        tok[n] = '\0';
+        s += n;
+
+        if (tok[0] >= '0' && tok[0] <= '9') {
+            int v = atoi(tok);
+            if (!status[0] && v >= 1 && v <= 5)
+                snprintf(status, sizeof(status), "%s", tok);
+            else if (level < 0)
+                level = (v < 0) ? -1 : (v > 100 ? 100 : v);
+            else if (plugged < 0)
+                plugged = v;
+        } else if (status[0]) {
+            size_t len = strlen(status);
+            snprintf(status + len, sizeof(status) - len, " %s", tok);
+        } else {
+            snprintf(status, sizeof(status), "%s", tok);
+        }
+    }
+
+    const char *sw = status_word(status);
+    if (sw != status)
+        snprintf(status, sizeof(status), "%s", sw);
+
+    snprintf(g_chg_status, sizeof(g_chg_status), "%s", status);
+    g_chg_level = level;
+    g_chg_plugged = plugged;
+
+    /* plugged=0 from the broadcast itself: no source is physically
+     * attached, so a stuck/stale "Charging" status must not light the
+     * charge LED (this device's battery service has done exactly that). */
+    const char *band = band_for(g_chg_status, g_chg_level);
+    if (plugged == 0)
+        band = "none";
+
+    /* Log only real transitions, not the bridge's periodic sticky
+     * re-emissions: charging started/stopped (status or plug changed)
+     * and zone crossings (band changed). */
+    if (strcmp(g_chg_status, g_log_status) ||
+        g_chg_plugged != g_log_plugged ||
+        strcmp(band, g_log_band)) {
+        LOGI("charge: %s %d%% plug=%d", status[0] ? status : "-", level, plugged);
+        snprintf(g_log_status, sizeof(g_log_status), "%s", g_chg_status);
+        g_log_plugged = plugged;
+        snprintf(g_log_band, sizeof(g_log_band), "%s", band);
+    }
+
+    charge_write(band);
+    if (!g_st.cur_pkg[0])       /* another owner holds the channel */
+        apply_band(band);
 }
 
 static void band_rgb(const char *band, int *r, int *g, int *b)
@@ -156,9 +235,14 @@ static void band_rgb(const char *band, int *r, int *g, int *b)
  * Every band owns its OWN section set: [charge.lower|middle|upper]
  * mode= + color= and the [charge.<band>.solid/breath/wave] chip
  * sections (each chip owns its timing keys). [charge] base keeps only
- * the thresholds. */
-static void apply_band(const char *band)
+ * the thresholds. Empty/unknown bands collapse to "none" (off). */
+static void apply_band(const char *band_in)
 {
+    const char *band = band_in ? band_in : "none";
+    if (strcmp(band, "lower") && strcmp(band, "middle") &&
+        strcmp(band, "upper"))
+        band = "none";
+
     int r = 0, g = 0, b = 0;
     char sec[32];
     if (!strcmp(band, "lower")) {
@@ -182,7 +266,6 @@ static void apply_band(const char *band)
         leds_all_off();
         snprintf(g_applied_band, sizeof(g_applied_band), "%s", fp0);
         status_write("charge", band, "", 0, 0, 0, "off");
-        LOGI("charge leds -> none (off)");
         return;
     }
 
@@ -200,8 +283,6 @@ static void apply_band(const char *band)
     const char *engine = led_event(sec, r, g, b);
     snprintf(g_applied_band, sizeof(g_applied_band), "%s", fp);
     status_write("charge", band, "", r, g, b, engine);
-    LOGI("charge leds -> %s (rgb=%d,%d,%d mode=%s)",
-         band, r, g, b, engine);
 }
 
 void apply_charge_leds(void)
@@ -215,15 +296,17 @@ void apply_charge_leds(void)
 
 /* ---------------- registry hooks ---------------- */
 
-/* the one refresh: write the band, repaint the LEDs unless another
- * owner (notify/ring) is currently showing something, and re-tune the
- * timer so the charging recheck cadence arms on plug / dies on unplug. */
+/* the one refresh: boot + SIGALRM (led.conf edited). Re-render the band
+ * from the last bridge state so a threshold/color edit repaints; with no
+ * CHG data yet the LEDs stay off. */
 static void charge_refresh(void)
 {
-    (void)eval_and_write();
-    if (!g_st.cur_pkg[0])
-        apply_charge_leds();
-    retune_timer();
+    if (g_st.cur_pkg[0])
+        return;
+    if (g_chg_status[0] && g_chg_plugged != 0)
+        apply_band(band_for(g_chg_status, g_chg_level));
+    else
+        apply_band("none");
 }
 
 /* ---------------- charge zone test (SIGQUIT) ---------------- */
@@ -269,31 +352,3 @@ void charge_test_next(void)
 }
 
 REGISTER_REFRESH(charge_refresh);
-REGISTER_UEVENT("power_supply", charge_refresh);
-
-/* ---------------- charge recheck cadence ----------------
- * mode_owns() consults this with cur_pkg == "" whenever the channel is
- * free. Ownership of "" is shared with the notification pool: notify
- * claims it while queue entries wait (its own adaptive cadence), charge
- * claims it only while the charger is live AND the pool is empty. The
- * two conditions are mutually exclusive, so the linker section order of
- * the two modes never matters.
- *
- * The tick re-runs the full band evaluation + fingerprint-gated repaint,
- * so a silenty crossed threshold lights up within one recheck period.
- * The timer goes away the moment the pool regains work or the status
- * leaves Charging/Full. */
-static int charge_owns(const char *pkg)
-{
-    if (pkg && pkg[0]) return 0;
-    if (queue_active() || queue_has_pending())   /* notify's idle claim */
-        return 0;
-    return g_charge_live;
-}
-
-static void charge_tick(void)
-{
-    charge_refresh();
-}
-
-REGISTER_MODE("charge", CHARGE_RECHECK_MS, charge_owns, charge_tick);

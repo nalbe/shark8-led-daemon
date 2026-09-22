@@ -2,11 +2,13 @@
  * mods/ring.c - incoming/outgoing call rainbow mode.
  *
  * Entered on a RING_ON command from the NLS bridge (it classifies the
- * dialer's live-call notification) and exited on RING_OFF, which resolves
- * the outcome: incoming -> missed-call verification window, outgoing ->
- * plain charge leds. Registers an adaptive timer MODE: while the
- * pseudo-package is armed, the core sleeps exactly until the [ring]
- * max_sec cap (disarmed when 0 = unlimited) and calls ring_tick() there.
+ * dialer's live-call notification) and exited on RING_OFF, which
+ * resolves the call end back to plain charge leds; if the call was
+ * missed, the bridge separately posts MISSED_ON for the tombstone and
+ * the missed-call LED takes over on its own (see mods/missed.c).
+ * Registers an adaptive timer MODE: while the pseudo-package is armed,
+ * the core sleeps exactly until the [ring] max_sec cap (disarmed when
+ * 0 = unlimited) and calls ring_tick() there.
  * Ring mode deliberately ignores the screen state (this ROM wakes the
  * display for incoming calls and the screen-on guard would kill the
  * effect); it exits on RING_OFF, timeout, or explicit disarm.
@@ -17,10 +19,9 @@
  * bridge - there is no telephony/dumpsys polling and no logdr focus
  * tracking anymore.
  *
- * Config: [ring] max_sec=<n> caps a ring rainbow (default 0 = unlimited;
- * a capped incoming ring resolves into the missed-call check). A test
- * rainbow holds until Disarm or the cap. Looked up through config.c's
- * generic kv store.
+ * Config: [ring] max_sec=<n> caps a ring rainbow (default 0 = unlimited).
+ * A test rainbow holds until Disarm or the cap. Looked up through
+ * config.c's generic kv store.
  *
  * The mode pattern is the extension seam for any LED "behavior" that is
  * driven by the timer rather than by a single arm/disarm:
@@ -119,17 +120,17 @@ void arm_ring(int incoming)
 
 /* ---------------- call end (RING_OFF / live cap) ---------------- */
 
-/* Resolve a live call end: drop the rainbow, repaint the charge leds,
- * and for an incoming call reopen the missed-call verification window
- * (the missed row may land right now). Event-driven: ring_tick -> cap,
- * nls_cmd -> RING_OFF. */
+/* Resolve a live call end: drop the rainbow and repaint the charge leds.
+ * A missed call needs no follow-up here - the bridge classifies the
+ * dialer's missed-call tombstone (channel "missed_calls") and posts
+ * MISSED_ON on its own, so there is no verification window to reopen
+ * and no call_log query. Event-driven: ring_tick -> cap, nls_cmd ->
+ * RING_OFF. */
 static void ring_resolve(const char *why)
 {
     g_st.cur_pkg[0] = '\0';
     apply_charge_leds();
-    if (g_ring_incoming)
-        dialer_reopen_window();
-    LOGI("ring ended (%s)%s", why, g_ring_incoming ? " -> missed check" : "");
+    LOGI("ring ended (%s)", why);
     retune_timer();
 }
 
@@ -156,11 +157,12 @@ static void ring_tick(void)
 {
     /* [ring] max_sec: optional hard cap for the rainbow.
      * 0 = unlimited; when a cap IS set, hitting it ends the rainbow.
-     * A live cap resolves the outcome exactly like a RING_OFF (a missed
-     * call landing right at the cap is still caught); a test rainbow is
-     * just disarmed - no missed-call side effects. The normal end of a
-     * live call is event-driven (RING_OFF from the NLS bridge), no
-     * polling here. */
+     * A live cap resolves the outcome exactly like a RING_OFF; a missed
+     * call landing right at the cap is still caught - the bridge posts
+     * MISSED_ON when the tombstone appears. A test rainbow is just
+     * disarmed - no missed-call side effects. The normal end of a live
+     * call is event-driven (RING_OFF from the NLS bridge), no polling
+     * here. */
     long cap = ring_max_sec();
     if (cap > 0 &&
         difftime(time(NULL), g_st.armed_at) >= (double)cap) {

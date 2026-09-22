@@ -14,9 +14,9 @@
  *   lifetime  = created + [notify(.app)] notif_max_sec, immutable
  *               (0 = unlimited: lives until cancelled).
  *   screen    = a fresh top that lands while the screen is on is parked
- *               in Q_HOLD with NO timer - the heartbeat polls for
- *               screen-off (there is no such uevent on this device),
- *               but the park is bounded by the grace check
+ *               in Q_HOLD with NO timer and NO screen polling - the
+ *               bridge's SCREEN 0 event is the edge that flashes the
+ *               park; the park is bounded by the grace check
  *               (notify_screen_delay_ms), which drops it even while the
  *               screen stays on.
  *   preempt   = a newer top behind the LED returns the current one to
@@ -147,18 +147,6 @@ int queue_has_pending(void)
     return 0;
 }
 
-/* a parked top (screen-on staging). This is the ONLY case that still
- * needs the 1s heartbeat: screen-off has no uevent here, so the fall of
- * the screen is caught by polling - bounded by the grace window, after
- * which the park is dropped. */
-int queue_has_hold(void)
-{
-    for (int i = 0; i < Q_MAX; i++)
-        if (g_q[i].pkg[0] && g_q[i].st == Q_HOLD)
-            return 1;
-    return 0;
-}
-
 int queue_active(void)
 {
     return q_active_ev() != NULL;
@@ -178,7 +166,8 @@ long queue_active_remain_ms(void)
 /* A canceled entry whose package is gone from the pool entirely is a
  * REAL dismissal: take the notification LED down. Entries still alive
  * mean the cancel was half of an app rebuild (cancel+post) - keep the
- * arm. Pseudo-packages (missed.call) reach this through owner_pkg. */
+ * arm. Pseudo-packages (ring/voip/missed) never reach this path: their
+ * channels are armed/disarmed by their own NLS commands, not by cancels. */
 static void q_maybe_cancel_armed(const char *pkg)
 {
     if (!g_st.cur_pkg[0]) return;
@@ -220,8 +209,8 @@ static void q_paint(struct qev *e)
 
 /* The only policy entry. Every trigger funnels here:
  *   - pool mutation (push/remove/remove_all)
- *   - the notify heartbeat (screen-off poll on a parked top; grace,
- *     expiry and cap deadlines)
+ *   - the SCREEN 0 event (flash a parked top) and the notify mode tick
+ *     (grace, expiry and cap deadlines)
  * It is cheap: with nothing changing it early-outs. */
 void queue_arbitrate(void)
 {
@@ -287,10 +276,10 @@ retry:
     }
 
     /* 5) screen is up: the top cannot show yet. Park it. No per-entry
-     *    timer; the heartbeat polls for screen-off (there is no such
-     *    uevent on this device), but the park is bounded by the SAME
-     *    grace even while the screen stays on - otherwise a pinned
-     *    screen kept the 1s poll alive until the lifetime cap. */
+     *    timer and no screen polling: the bridge's SCREEN 0 event is the
+     *    edge that flashes the park, and the park is bounded by the SAME
+     *    grace even while the screen stays on - otherwise a pinned screen
+     *    kept a parked entry alive until the lifetime cap. */
     if (screen_on()) {
         if (e->st == Q_HOLD && age >= q_grace_s(e->pkg)) {
             LOGI("queue: %s grace expired while screen on (%lds), dropped",
@@ -340,7 +329,7 @@ void queue_push(const char *pkg, int id)
         LOGI("queue: push %s id=%d", pkg, id);
     }
     queue_arbitrate();
-    retune_timer();     /* a park needs the 1s screen-off poll armed */
+    retune_timer();
 }
 
 void queue_remove(const char *pkg, int id)
@@ -396,6 +385,6 @@ void queue_clear(void)
         }
     if (had) {
         LOGI("queue: cleared (led toggle)");
-        retune_timer();     /* pool empty: drop any screen-off poll */
+        retune_timer();     /* pool empty: drop the notify heartbeat */
     }
 }

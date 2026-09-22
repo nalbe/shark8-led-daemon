@@ -1,14 +1,11 @@
 /*
  * mods/voip.c - messenger call (VoIP) rainbow mode.
  *
- * Lights the traveling-wave rainbow while a messenger (Telegram /
- * WhatsApp / Viber / Signal) is in a call. The call detection lives in
- * the NotifyBridge app (com.bastet.notifybridge), which inspects every
- * notification as it posts and removes it: an incoming/active messenger
- * call is a notification on the messenger's call channel (Telegram:
- * "incoming_calls40", category CALL, audio usage VOICE_COMMUNICATION),
- * so call START and END are plain notification events - no audio-policy
- * polling, no dumpsys.
+ * Lights the traveling-wave rainbow while a messenger (any app the
+ * bridge classifies as a call notification) is in a call. Call
+ * detection lives entirely in the NotifyBridge app: it inspects every
+ * notification as it posts and removes it, and a call notification is
+ * identified by its category/channel - not by a hardcoded package list.
  *
  * The rainbow animation runs on the AW2033 chip (traveling-wave mode,
  * led_wave_rgb) - voip.c only arms it and lets the mode machinery
@@ -17,9 +14,10 @@
  * Transport (notify_bus socket), sent by NLS:
  *   VOIP_ON <pkg>     call notification posted    -> arm the rainbow
  *   VOIP_OFF <pkg>    call notification removed   -> disarm, channel back
- * The mode machinery only owns the LED while the mode is armed.
- * voip_try() keeps messenger chat messages from recoloring the LED
- * mid-call; chats on their own still take the normal color path.
+ * The mode machinery only owns the LED while the mode is armed. During
+ * a call the priority pool waits (queue_arbitrate sees voip_active), so
+ * a chat message from the same app never recolors the rainbow - that is
+ * the pool's job, no package list needed here.
  *
  * Safety net: the max_sec cap bounds a rainbow that never got its
  * VOIP_OFF (NLS died mid-call, event dropped). Counts from arming,
@@ -27,7 +25,7 @@
  *
  * Config: [voip] max_sec=<n> seconds (default VOIP_MAX_SEC); 0 = never
  *         auto-disarm the rainbow (a lost VOIP_OFF then sticks).
- *         [voip] packages=c1,c2,... overrides the messenger list.
+ *         [voip] color=r,g,b for the rainbow base color.
  */
 
 #include <stdio.h>
@@ -38,40 +36,9 @@
 #define VOIP_PKG      "voip.call"
 #define VOIP_MAX_SEC  300         /* safety cap (s) for a missed VOIP_OFF */
 
-/* default messenger packages (comma list string, also the [voip] fallback) */
-#define VOIP_DEF_PKGS "org.telegram.messenger," \
-                       "com.whatsapp," \
-                       "com.viber.voip," \
-                       "org.thoughtcrime.securesms," \
-                       "com.snapchat," \
-                       "com.google.android.apps.tachyon"
-
 int voip_active(void)
 {
     return g_st.cur_pkg[0] && !strcmp(g_st.cur_pkg, VOIP_PKG);
-}
-
-/* the configured messenger package list (for the per-marker checks) */
-static const char *voip_pkg_list(void)
-{
-    const char *list = conf_get_str("voip", "packages");
-    return (list && list[0]) ? list : VOIP_DEF_PKGS;
-}
-
-static int is_messenger(const char *pkg)
-{
-    if (!pkg || !pkg[0]) return 0;
-    const char *list = voip_pkg_list();
-    size_t pl = strlen(pkg);
-    for (const char *p = list; *p;) {
-        const char *e = strchr(p, ',');
-        size_t L = e ? (size_t)(e - p) : strlen(p);
-        if (L == pl && !strncmp(p, pkg, L)) return 1;
-        if (!e) break;
-        p = e + 1;
-        while (*p == ' ' || *p == ',') p++;
-    }
-    return 0;
 }
 
 /* safety cap for a rainbow that missed its VOIP_OFF, seconds; [voip]
@@ -156,17 +123,6 @@ static long voip_next_wake(void)
     long remain = (long)(cap - age);
     if (remain < 1) remain = 1;
     return remain * 1000L;
-}
-
-/* Called by notify's default handler before it colors a package.
- * Returns 1 if voip owns the led (mid-call: never let a chat recolor the
- * rainbow), 0 for a normal chat message. Call START/END themselves are
- * event-driven: NLS sends VOIP_ON/VOIP_OFF ahead of the ENQ/CAN. */
-int voip_try(const char *pkg)
-{
-    if (!is_messenger(pkg)) return 0;     /* not ours -> normal color */
-    if (voip_active()) return 1;          /* mid-call: keep the rainbow */
-    return 0;                              /* chat message -> normal color */
 }
 
 REGISTER_MODE_WAKE("voip", 1000, voip_owns, voip_tick, voip_next_wake);

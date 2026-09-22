@@ -20,7 +20,7 @@ import java.util.Locale
  *                   sync=0|1 (LCFG0.SYNC master-channel lock)
  * There is NO fallback anywhere: a chip section carries its own timing,
  * nothing is inherited from the base section.
- * [led] carries only daemon/chip globals: logging, trace_sysfs, imax.
+ * [led] carries only daemon/chip globals: logging, imax.
  */
 data class Rule(val pkg: String, val r: Int, val g: Int, val b: Int)
 
@@ -73,10 +73,8 @@ data class LedConf(
     var ringCapSec: Long = 0,
     var ringColor: Triple<Int, Int, Int> = Triple(255, 255, 255),
     var voipMaxSec: Long = 300,
-    var voipPackages: String = "",
     var voipColor: Triple<Int, Int, Int> = Triple(255, 255, 255),
     var logging: Boolean = true,
-    var traceSysfs: Boolean = false,
     var imax: Int = 30,
     var chargeLower: Render = Render().chargeTiming(),
     var chargeMiddle: Render = Render().chargeTiming(),
@@ -263,7 +261,6 @@ data class LedConf(
                     val v = line.substring(i + 1).trim()
                     when (k) {
                         "max_sec" -> v.toLongOrNull()?.let { voipMaxSec = it }
-                        "packages" -> voipPackages = v
                         "color" -> parseRgb(v)?.let { voipColor = it }
                         "mode" -> parseMode(v)?.let { voipRender.mode = it }
                     }
@@ -297,7 +294,6 @@ data class LedConf(
                     val v = line.substring(i + 1).trim()
                     when (k) {
                         "logging" -> v.toIntOrNull()?.let { logging = it != 0 }
-                        "trace_sysfs" -> v.toIntOrNull()?.let { traceSysfs = it != 0 }
                         "imax" -> v.toIntOrNull()?.let { imax = it.coerceIn(1, 40) }
                     }
                 }
@@ -346,7 +342,7 @@ data class LedConf(
         sb.append("# [charge]   thresholds ONLY; each band owns color/timing\n")
         sb.append("# [notify]   shared behavior: notif_max_sec, default color\n")
         sb.append("# [ring]     incoming call rainbow: max_sec, base color\n")
-        sb.append("# [voip]     messenger call rainbow: max_sec, packages, base color\n")
+        sb.append("# [voip]     messenger call rainbow: max_sec, base color\n")
         sb.append("# [led]      daemon logging + global chip Imax\n")
         sb.append("# [missed]   missed-call indication: color, max_sec\n")
         sb.append("# [alarm]    alarm clock indication: color, max_sec\n")
@@ -384,12 +380,10 @@ data class LedConf(
         appendMode(sb, "ring", ringRender)
         sb.append("\n[voip]\n")
         sb.append("max_sec=").append(voipMaxSec).append('\n')
-        if (voipPackages.isNotBlank()) sb.append("packages=").append(voipPackages).append('\n')
         sb.append("color=").append(rgb(voipColor)).append('\n')
         appendMode(sb, "voip", voipRender)
         sb.append("\n[led]\n")
         sb.append("logging=").append(if (logging) 1 else 0).append('\n')
-        sb.append("trace_sysfs=").append(if (traceSysfs) 1 else 0).append('\n')
         sb.append("imax=").append(imax).append('\n')
         sb.append("\n# GUI preview calibration (daemon ignores): how bright each\n")
         sb.append("# LED looks vs the picker value. green=100 is the reference;\n")
