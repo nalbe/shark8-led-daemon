@@ -86,7 +86,9 @@ Events:
 - **ring** - SIM/dialer calls, incoming and outgoing
 - **voip** - messenger calls (any app the bridge classifies as a call
   notification - category CALL / call channel)
-- **missed** - missed-call LED (bridge event `MISSED_ON`/`MISSED_OFF`)
+- **missed** - missed-call LED (bridge event `MISSED_ON`/`MISSED_OFF`).
+  The missed tombstone is the dialer's own notification, so it obeys the
+  system "Blink light" toggle like the generic pool (unlike live calls)
 - **alarm** - alarm clock LED
 
 Every one accepts any of the four renderers and its own color, timing,
@@ -174,8 +176,9 @@ the light-pulse gate and the test hooks are daemon-side and unaffected.
 ### System gates
 
 - **"Blink light" toggle** (Settings -> Notifications -> Blink light):
-  when off, the daemon drops all notification LEDs at a single gate (call
-  rainbows, alarms and charge are unaffected). The bridge watches
+  when off, the daemon drops all notification LEDs (generic pool plus the
+  missed-call LED - the dialer's tombstone is a notification too) while
+  call rainbows, alarms and charge are unaffected. The bridge watches
   `Settings.System` with a `ContentObserver` and pokes `PULSE 0` the
   moment any writer changes it, so a running notification LED goes off
   instantly. The pull side is pure state: `pulse_note()` stores the
@@ -282,7 +285,9 @@ kill -WINCH $(pidof chgd)  # test VoIP call (messenger rainbow, held until Disar
 kill -TSTP $(pidof chgd)   # test ALARM ([alarm] renderer, preempts whatever owns the channel)
 kill -PWR  $(pidof chgd)   # test MISSED call (same path as the bridge's MISSED_ON event)
 kill -QUIT  $(pidof chgd)  # cycle charge bands: lower -> middle -> upper -> none
-kill -USR2  $(pidof chgd)  # "Blink light" toggle OFF: note off-state + disarm notify LED
+kill -USR2  $(pidof chgd)  # Disarm: kill the armed LED + clear the pool
+                            # (does NOT touch the "Blink light" gate state -
+                            # that only ever follows the bridge's PULSE events)
 kill -CONT  $(pidof chgd)  # truncate /data/local/tmp/ledd.log
 kill -ALRM  $(pidof chgd)  # reload kick when the inotify watcher is unavailable (else redundant - edits are auto-detected via inotify)
 ```

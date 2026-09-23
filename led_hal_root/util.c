@@ -107,9 +107,12 @@ void atomic_write(const char *path, const char *buf, size_t len)
  *
  * Android's own "Notification light" toggle lives in
  * Settings.System NOTIFICATION_LIGHT_PULSE (Settings -> Notifications).
- * Only the NOTIFICATION LED honours it - charge bands, call rainbows
+ * Only the NOTIFICATION LEDs honour it - charge bands, call rainbows
  * and the alarm are separate "whatever signals", so they must NOT be
- * gated here. One gate point: arm_notification_ex() (mods/notify.c).
+ * gated here. Gate points: arm_notification_ex() (mods/notify.c) for the
+ * generic notification pool and missed_on() (mods/missed.c) for the
+ * missed-call tombstone - the bridge emits it as a notification and the
+ * stock toggle must kill it like any other notification LED.
  *
  * State comes ONLY from the bridge's NLS "PULSE <0|1>" event: the
  * notify-bridge watches the settings key with a ContentObserver and

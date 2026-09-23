@@ -117,17 +117,17 @@ static void q_free(struct qev *e)
 static long q_expiry_s(const char *pkg)
 {
     int r, g, b;
-    return conf_pkg_rgb(pkg, &r, &g, &b)
-        ? conf_get_int("notify.app", "notif_max_sec", conf_notif_max_sec())
-        : conf_notif_max_sec();
+    if (!conf_pkg_rgb(pkg, &r, &g, &b))
+        return conf_notif_max_sec();          /* no rule: shared [notify] cap */
+    return conf_get_int(conf_notify_sec(pkg), "notif_max_sec",
+                        conf_notif_max_sec());
 }
 
 static long q_grace_s(const char *pkg)
 {
-    int r, g, b;
-    long ms = conf_pkg_rgb(pkg, &r, &g, &b)
-        ? conf_get_int("notify.app", "notify_screen_delay_ms", 60000)
-        : conf_get_int("notify", "notify_screen_delay_ms", 60000);
+    /* pending window is SHARED (not per-app): one [notify] value */
+    (void)pkg;
+    long ms = conf_get_int("notify", "notify_screen_delay_ms", 60000);
     if (ms < 0) ms = 0;
     return ms / 1000L;
 }

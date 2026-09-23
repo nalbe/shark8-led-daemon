@@ -55,9 +55,11 @@ void log_set_enabled(int on);
 /* ---------------- sysfs / device helpers ---------------- */
 
 /* Android's "Notification light" toggle (Settings.System
- * NOTIFICATION_LIGHT_PULSE) honoured by the NOTIFICATION LED only.
- * State comes only from the bridge's NLS PULSE events (pulse_note);
- * unknown before the first event = on. */
+ * NOTIFICATION_LIGHT_PULSE) honoured by the NOTIFICATION LEDs only
+ * (generic pool + missed-call tombstone). Call rainbows, alarms and
+ * charge are deliberately unaffected. State comes only from the
+ * bridge's NLS PULSE events (pulse_note); unknown before the first
+ * event = on. */
 int  pulse_on(void);
 void pulse_note(int on);        /* NLS PULSE event: the only source */
 int  read_line(const char *path, char *out, size_t n);
@@ -131,6 +133,13 @@ void conf_watch_handle(void);        /* drain events, note changes */
 /* generic kv: any [section] key=value in led.conf is readable by name */
 const char *conf_get_str(const char *sec, const char *key); /* NULL = absent */
 long conf_get_int(const char *sec, const char *key, long def);
+/* preset section a notification for [pkg] must use: the synthetic
+ * [notify.<pkg>] when that rule carries an extended tail, else the
+ * legacy shared [notify.app] (color-only rules). Callers pick "notify"
+ * themselves for packages without a rule. */
+const char *conf_notify_sec(const char *pkg);
+/* does a [section] exist at all? (e.g. a synthetic per-rule preset) */
+int  conf_sec_exists(const char *sec);
 
 /* ---------------- core services ---------------- */
 
@@ -159,7 +168,7 @@ void notif_cancel_all(const char *pkg);
 void queue_push(const char *pkg, int id);       /* ENQ: record + arbitrate  */
 void queue_remove(const char *pkg, int id);     /* CAN: drop one id         */
 void queue_remove_all(const char *pkg);         /* CAN_ALL: drop a package  */
-void queue_clear(void);                         /* PULSE off / GUI toggle   */
+void queue_clear(void);                         /* PULSE off / USR2 disarm */
 void queue_arbitrate(void);                     /* single policy entry      */
 int  queue_has(const char *pkg);                /* any live entry for pkg   */
 int  queue_has_pending(void);                   /* non-active entries await */

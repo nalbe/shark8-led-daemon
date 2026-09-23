@@ -9,6 +9,63 @@ out of here:
 - the AW2033 chip controller and `awctl` live in the **aw2033-driver** repo
   (this repo ships only the prebuilt `libaw2033.a`)
 
+## Revision: module ships bridge v6 again (2026-09-23, v3.5.3)
+
+The v3.5 missed-call rework (pure bridge events, `mods/missed.c`) needs the
+notify-bridge app to classify the dialer's missed-call tombstone
+(`missed.on`/`missed.off` -> `MISSED_ON/MISSED_OFF`) - that classification
+only exists in bridge **v6.0.0**. The module folder (and the v3.5.x release
+zip) still carried bridge **v5.0.0**, which never emits missed events, so
+after the v3.5 upgrade a silently-ignored incoming call left no LED at all:
+the daemon logged only `ring reclassified: outgoing` + `ring ended (RING_OFF)`
+and no `MISSED_ON` ever arrived. The `notifybridge.json` routes were v6-ready
+already (that part shipped with v3.5); only the APK was stale.
+
+1. `module/notifybridge-release.apk` replaced with the v6.0.0 release build
+   (same Android-Debug signing, versionCode 5 -> 6, installs over v5
+   without dropping the notification-listener grant).
+2. v3.5.3 / versionCode 28.
+
+## Revision: Disarm (SIGUSR2) no longer poisons the blink-light gate (2026-09-23, v3.5.2)
+
+Repro (live on the Shark8): toggle ON in settings -> fake Telegram test arms
+-> GUI "Disarm" -> every further test/notification dropped while the setting
+stays ON. `kill -USR2` was a leftover of the pre-v2.17 GUI toggle: it wrote
+`pulse_note(0)` straight into the daemon, permanently flipping the gate to
+off with nothing behind it (the GUI stopped carrying a toggle, and the
+setting only changes through the settings app, which the bridge observer
+reports on its own). Daemon-side "state" and the real setting disagreed
+until the next toggle flip or a reconnect replay.
+
+1. **SIGUSR2 is now a pure disarm**: drop `pulse_note(0)` from the
+   `g_clear` branch (`core.c`); it keeps `queue_clear()` +
+   `disarm_notification()`. The gate state may only arrive as the bridge's
+   `PULSE` event (live change or connect replay) - single source of truth
+   restored, the desync class is gone.
+2. **Docs**: README SIGUSR2 hook and `chgd.h` `queue_clear()` comment
+   updated; the disarm no longer pretends to flip the toggle.
+
+## Revision: missed-call LED honours the "Blink light" toggle (2026-09-23, v3.5.1)
+
+The system "Blink light" toggle (`Settings.System.notification_light_pulse`)
+was a dead letter for the missed-call plane: the neutral state desync the
+user hit ("setting off, LED still blinking") was the missed tombstone - the
+dialer's own notification - arming through a path that never consulted the
+gate.
+
+1. **`missed_on()` is gated on `pulse_on()`.** `mods/missed.c` dropped a
+   `MISSED_ON` while the toggle is off (logged, no paint) instead of arming
+   `missed.call` unconditionally. The missed tombstone IS a notification, so
+   stock semantics apply: `notification_light_pulse=0` kills it like any
+   other notification LED.
+2. **No disarming-side change needed.** The core's `PULSE 0` branch already
+   calls `disarm_notification()` which clears *any* `cur_pkg` - so an armed
+   missed LED dies the instant the toggle flips off, and a stale
+   `MISSED_OFF` after a gated drop is still a correct no-op.
+3. **Docs aligned.** The gate list in README ("all notification LEDs") and
+   the `util.c` / `chgd.h` comments now name missed explicitly; the excluded
+   set (call rainbows, alarms, charge) is unchanged.
+
 ## Revision: missed-call LED is 100% bridge events; the last child process is gone (2026-09-23, v3.5)
 
 1. **The last `content query` fork is deleted.** `mods/dialer.c` +

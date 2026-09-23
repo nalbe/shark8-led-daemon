@@ -8,14 +8,21 @@
  *
  * SECTIONS:
  *   [suppress]  one package per line - never lights the LED
- *   [rules]     pkg=r,g,b   (0-255 per channel; no more bit masks)
+ *   [rules]     pkg=r,g,b[,...]  (0-255 per channel). The optional comma
+ *               tail carries that app's OWN notify preset (cap, pending
+ *               window, renderer mode, chip knobs) and is synthesized into
+ *               a [notify.<pkg>] section at load. Without the tail the app
+ *               behaves exactly as before (shared [notify.app] preset).
  *   [charge]    first_threshold / second_threshold (%) ONLY - each band
  *               owns its renderer: [charge.lower|middle|upper] mode=
  *               color= plus the [charge.<band>.solid/breath/wave] chip
  *               sections (timing = chip-owned)
- *   [notify]    SHARED behavior for every app:
- *               notif_max_sec (0 = unlimited), default_color r,g,b for
- *               apps without a [rules] entry (per-app color = [rules])
+ *   [notify]    behavior for apps WITHOUT a [rules] entry:
+ *               notif_max_sec (0 = unlimited), default_color r,g,b,
+ *               notify_screen_delay_ms + renderer mode/chip sections
+ *   [notify.app]  legacy shared preset for [rules] entries that carry only
+ *               the color triple (no extended tail) - kept for backwards
+ *               compatibility, not written by the template anymore
  *   [ring]      incoming-call rainbow: max_sec + v3 color
  *   [voip]      messenger-call rainbow: max_sec + v3 color
  *
@@ -68,9 +75,11 @@
 #define MAX_RULES 96
 
 /* generic key-value store for mod-owned sections (e.g. [ring],
- * [charge.solid], [charge.breath], [charge.wave], ...) */
-#define MAX_KV   256
-struct kv { char sec[24]; char key[32]; char val[48]; };
+ * [charge.solid], [charge.breath], [charge.wave], ...) plus the synthetic
+ * per-rule [notify.<pkg>] presets. sec holds long section names
+ * ("notify.<very.long.pkg>.breath"), val holds long [rules] values. */
+#define MAX_KV   2560
+struct kv { char sec[128]; char key[32]; char val[192]; };
 
 /* builtin fallbacks */
 #define DEF_FIRST_AT 90
@@ -199,6 +208,161 @@ static void kv_put(const char *sec, const char *key, const char *val)
     g_nkv++;
 }
 
+/* internal kv-table probe (no reload guard - callers reload first) */
+static int kv_has_sec(const char *sec)
+{
+    for (int i = 0; i < g_nkv; i++)
+        if (!strcmp(g_kv[i].sec, sec)) return 1;
+    return 0;
+}
+
+/* drop every entry of a section - used before re-synthesizing an
+ * overridden [rules] rule so a shorter tail can't leak old values */
+static void kv_clear_sec(const char *sec)
+{
+    for (int i = 0; i < g_nkv; i++) {
+        if (!strcmp(g_kv[i].sec, sec)) {
+            g_kv[i] = g_kv[--g_nkv];
+            i--;
+        }
+    }
+}
+
+/* numeric kv setter for the synthesized preset */
+static void kvi(const char *sec, const char *key, long v)
+{
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%ld", v);
+    kv_put(sec, key, buf);
+}
+
+/* ---------------- extended [rules] presets ---------------- */
+
+/* Pull one leading int token (comma-terminated) out of the tail cursor.
+ * The cursor advances only on success - the token stream is left-prefix,
+ * so the FIRST broken token stops the whole tail. */
+static int tok_int(const char **p, long *out)
+{
+    const char *s = *p;
+    if (!s) return 0;
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (end == s) return 0;                /* no int at the head         */
+    *out = v;
+    *p = (*end == ',') ? end + 1 : NULL;   /* consumed; NULL = tail done */
+    return 1;
+}
+
+/* mode word ("off"|"solid"|"breath"|"wave"), same left-prefix cursor */
+static int tok_mode(const char **p, char out[8])
+{
+    const char *s = *p;
+    if (!s) return 0;
+    const char *end = strchr(s, ',');
+    size_t n = end ? (size_t)(end - s) : strlen(s);
+    static const char *modes[] = { "off", "solid", "breath", "wave" };
+    for (size_t i = 0; i < 4; i++)
+        if (strlen(modes[i]) == n && !strncmp(s, modes[i], n)) {
+            strcpy(out, modes[i]);
+            *p = end ? end + 1 : NULL;
+            return 1;
+        }
+    return 0;
+}
+
+/* The extended tail is  r,g,b, cap, mode, solid_cur, breath, wave
+ * - every slot after the first three is optional; the modules read the
+ * synthesized keys exactly as they read a hand-written [notify.*] block:
+ *   [notify.<pkg>]        notif_max_sec / mode
+ *   [notify.<pkg>.solid]  cur=r,g,b
+ *   [notify.<pkg>.breath] sync, repeat, cur_r/g/b, rise, hold, fall, offt
+ *   [notify.<pkg>.wave]   same + t0=r,g,b
+ * Absent keys fall back to module defaults, so a partially filled tail
+ * degrades gracefully. A rule whose tail has no cap (first token) keeps
+ * the legacy [notify.app] fallback instead of the synthetic section.
+ * The pending window (notify_screen_delay_ms) is NOT per-app: it stays a
+ * single shared [notify] value. */
+static void rule_synth(const char *pkg, const char *tail)
+{
+    const char *p = tail;
+    long v;
+    long cap = -1;
+    char mode[8] = "";
+    long scur[3] = { -1, -1, -1 };
+    long bsync = -1, brep = -1, bcur[3] = { -1, -1, -1 };
+    long brise = -1, bhold = -1, bfall = -1, bofft = -1;
+    long wsync = -1, wt0[3] = { -1, -1, -1 }, wrep = -1;
+    long wrise = -1, whold = -1, wfall = -1, wofft = -1;
+
+    if (tok_int(&p, &v)) cap = v;
+    tok_mode(&p, mode);
+    for (int i = 0; i < 3 && tok_int(&p, &v); i++) scur[i] = v;
+    if (tok_int(&p, &v)) bsync = v;
+    if (tok_int(&p, &v)) brep = v;
+    for (int i = 0; i < 3 && tok_int(&p, &v); i++) bcur[i] = v;
+    if (tok_int(&p, &v)) brise = v;
+    if (tok_int(&p, &v)) bhold = v;
+    if (tok_int(&p, &v)) bfall = v;
+    if (tok_int(&p, &v)) bofft = v;
+    if (tok_int(&p, &v)) wsync = v;
+    for (int i = 0; i < 3 && tok_int(&p, &v); i++) wt0[i] = v;
+    if (tok_int(&p, &v)) wrep = v;
+    if (tok_int(&p, &v)) wrise = v;
+    if (tok_int(&p, &v)) whold = v;
+    if (tok_int(&p, &v)) wfall = v;
+    if (tok_int(&p, &v)) wofft = v;
+
+    /* broken tail (no cap token): the rule behaves like a color-only one */
+    if (cap < 0) return;
+
+    char b[sizeof(g_kv[0].sec)];
+    char s[sizeof(g_kv[0].sec)];
+    char triple[64];
+    snprintf(b, sizeof(b), "notify.%s", pkg);
+    kv_clear_sec(b);
+    snprintf(s, sizeof(s), "%s.solid", b);  kv_clear_sec(s);
+    snprintf(s, sizeof(s), "%s.breath", b); kv_clear_sec(s);
+    snprintf(s, sizeof(s), "%s.wave", b);   kv_clear_sec(s);
+
+    kvi(b, "notif_max_sec", cap);
+    if (mode[0]) kv_put(b, "mode", mode);
+
+    if (scur[2] >= 0) {                     /* all three parsed */
+        snprintf(s, sizeof(s), "%s.solid", b);
+        snprintf(triple, sizeof(triple), "%ld,%ld,%ld", scur[0], scur[1], scur[2]);
+        kv_put(s, "cur", triple);
+    }
+    if (bsync >= 0 || brep >= 0 || bcur[2] >= 0 || brise >= 0 || bhold >= 0 ||
+        bfall >= 0 || bofft >= 0) {
+        snprintf(s, sizeof(s), "%s.breath", b);
+        if (bsync >= 0) kvi(s, "sync", bsync);
+        if (brep >= 0) kvi(s, "repeat", brep);
+        if (bcur[2] >= 0) {
+            kvi(s, "cur_r", bcur[0]);
+            kvi(s, "cur_g", bcur[1]);
+            kvi(s, "cur_b", bcur[2]);
+        }
+        if (brise >= 0) kvi(s, "rise", brise);
+        if (bhold >= 0) kvi(s, "hold", bhold);
+        if (bfall >= 0) kvi(s, "fall", bfall);
+        if (bofft >= 0) kvi(s, "offt", bofft);
+    }
+    if (wsync >= 0 || wrep >= 0 || wt0[2] >= 0 || wrise >= 0 || whold >= 0 ||
+        wfall >= 0 || wofft >= 0) {
+        snprintf(s, sizeof(s), "%s.wave", b);
+        if (wt0[2] >= 0) {
+            snprintf(triple, sizeof(triple), "%ld,%ld,%ld", wt0[0], wt0[1], wt0[2]);
+            kv_put(s, "t0", triple);
+        }
+        if (wsync >= 0) kvi(s, "sync", wsync);
+        if (wrep >= 0) kvi(s, "repeat", wrep);
+        if (wrise >= 0) kvi(s, "rise", wrise);
+        if (whold >= 0) kvi(s, "hold", whold);
+        if (wfall >= 0) kvi(s, "fall", wfall);
+        if (wofft >= 0) kvi(s, "offt", wofft);
+    }
+}
+
 /* parse one key=value line into section (built-in sections only);
  * everything else already lives in the generic kv table */
 static void parse_value(const char *sec, const char *key, const char *val)
@@ -232,24 +396,51 @@ static void parse_value(const char *sec, const char *key, const char *val)
         return;
     }
     if (!strcmp(sec, "rules")) {
+        /* extended line  pkg=r,g,b[,cap[,mode[,...]]]: the colour is the
+         * FIRST THREE comma tokens; the optional preset tail is everything
+         * after the 3rd comma. The triple is copied out for parse_rgb, the
+         * tail is absorbed into the synthetic [notify.<pkg>] section. */
+        const char *orig = val;
+        const char *tail = NULL;
+        char col[64];
+        const char *p = val;
+        for (int i = 0; i < 3; i++) {
+            const char *c = strchr(p, ',');
+            if (!c) break;              /* colour-only line, keep entire val */
+            p = c + 1;
+            if (i == 2) tail = p;
+        }
+        if (tail) {
+            size_t n = (size_t)(p - val) - 1;
+            if (n >= sizeof(col)) n = sizeof(col) - 1;
+            memcpy(col, val, n);
+            col[n] = '\0';
+            val = col;
+        }
         if (!parse_rgb(val, &r, &g, &b)) {
-            LOGI("conf: bad [rules] %s=%s (want r,g,b)", key, val);
+            LOGI("conf: bad [rules] %s=%s (want r,g,b first)", key, orig);
             return;
         }
         /* file wins over builtin for the same package */
+        int present = 0;
         for (int i = 0; i < g_nrules; i++) {
             if (!strcmp(g_rules[i].pkg, key)) {
                 g_rules[i].r = r; g_rules[i].g = g; g_rules[i].b = b;
-                return;
+                present = 1;
+                break;
             }
         }
-        if (g_nrules < MAX_RULES) {
+        if (!present && g_nrules < MAX_RULES) {
             snprintf(g_rules[g_nrules].pkg, sizeof(g_rules[0].pkg), "%s", key);
             g_rules[g_nrules].r = r;
             g_rules[g_nrules].g = g;
             g_rules[g_nrules].b = b;
             g_nrules++;
         }
+        /* color-only lines keep the shared legacy preset; extended lines
+         * synthesize a per-package section (a broken tail falls back to
+         * color-only behaviour inside rule_synth) */
+        if (tail) rule_synth(key, tail);
     }
 }
 
@@ -261,8 +452,8 @@ static void load_file(void)
         LOGI("conf: no %s, using builtins", CONF_PATH);
         return;
     }
-    char sec[32] = "";
-    char line[256];
+    char sec[128] = "";
+    char line[512];
     while (fgets(line, sizeof(line), f)) {
         trim(line);
         if (!*line || line[0] == '#' || line[0] == ';') continue;
@@ -284,7 +475,11 @@ static void load_file(void)
             trim(line);
             char *val = eq + 1;
             trim(val);
-            kv_put(sec, line, val);      /* every key lands in the table */
+            /* every key lands in the table - except [rules], whose lines
+             * parse_value owns (extended ones become the synthetic
+             * [notify.<pkg>] sections instead) */
+            if (strcmp(sec, "rules") != 0)
+                kv_put(sec, line, val);
             parse_value(sec, line, val); /* built-in sections apply it    */
         }
     }
@@ -454,4 +649,31 @@ long conf_get_int(const char *sec, const char *key, long def)
     long x = atol(v);
     if (!x && (v[0] < '0' || v[0] > '9') && v[0] != '-') return def;
     return x;
+}
+
+/* scratch buffer for conf_notify_sec's synthetic section name; returned
+ * pointer stays valid until the next conf_notify_sec call */
+static char conf_sec_buf[128];
+
+/* does a section exist at all? (e.g. the synthetic [notify.<pkg>] preset
+ * generated from an extended [rules] line) */
+int conf_sec_exists(const char *sec)
+{
+    conf_maybe_reload();
+    return kv_has_sec(sec);
+}
+
+/* preset section a notification for [pkg] must read:
+ *   extended rule -> synthetic "notify.<pkg>" (its own preset),
+ *   color-only rule -> legacy shared "notify.app",
+ *   (callers pass their own "notify" for packages without a rule).
+ * The returned pointer is stable until the next reload. */
+const char *conf_notify_sec(const char *pkg)
+{
+    conf_maybe_reload();
+    if (pkg && pkg[0]) {
+        snprintf(conf_sec_buf, sizeof(conf_sec_buf), "notify.%s", pkg);
+        if (kv_has_sec(conf_sec_buf)) return conf_sec_buf;
+    }
+    return "notify.app";
 }

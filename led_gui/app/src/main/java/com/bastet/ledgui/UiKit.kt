@@ -1,5 +1,6 @@
 package com.bastet.ledgui
 
+import android.app.AlertDialog
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
@@ -14,10 +15,14 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewGroup
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ListView
 import android.widget.RadioButton
 import android.widget.RadioGroup
 import android.widget.ScrollView
@@ -30,6 +35,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
+import java.util.Locale
 
 /** AW2033 color simulation for previews. The chip scales each channel's
  *  drive current (0..15) against the color's PWM amplitude (0..255); the
@@ -638,6 +644,295 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
         }
     }
 
+    /** Fixed-height internal-scroll list used inside a card: the card keeps
+     *  its size and a long list scrolls INSIDE the box (like the old
+     *  multiline text field) instead of stretching the page. Returns the
+     *  inner LinearLayout to fill with rows. */
+    protected fun LinearLayout.scrollListBox(heightDp: Int = 176, stretch: Boolean = false): LinearLayout {
+        val frame = FrameLayout(context)
+        val scroll = object : ScrollView(context) {
+            override fun onTouchEvent(ev: MotionEvent?): Boolean {
+                // The page ScrollView steals any vertical drag at touch-slop
+                // BEFORE this box becomes dragged (its intercept runs first),
+                // then clamps to zero and the gesture dies. When the box
+                // content overflows, block ancestor interception for this
+                // gesture at DOWN so the box itself receives the full drag.
+                if (ev?.action == MotionEvent.ACTION_DOWN) {
+                    val c = getChildAt(0)
+                    if (c != null && c.height > height - paddingTop - paddingBottom) {
+                        parent?.requestDisallowInterceptTouchEvent(true)
+                    }
+                }
+                return super.onTouchEvent(ev)
+            }
+        }
+        // NO isFillViewport: with it the wrapper re-measures a wrap-content
+        // child to the exact viewport, clips the overflow and the box can
+        // never scroll on this ROM. Without it the child keeps its natural
+        // height and the box scrolls; the box itself stays 176dp via its
+        // own layout params.
+        val list = LinearLayout(context)
+        list.orientation = VERTICAL
+        list.setPadding(dpi(2), dpi(2), dpi(2), dpi(2))
+        scroll.addView(list, LayoutParams(mP, wP))
+
+        // Scroll fades on the box edges: they show ONLY while content is
+        // clipped on that side (bottom = more below, top = already scrolled).
+        // Pinned to the frame so they stay put while the list scrolls.
+        val shadowH = dpi(22)
+        val cardBg = parse("#FF1E1E1E")
+        val clear = cardBg and 0x00FFFFFF
+        fun fadeUp(): GradientDrawable =
+            GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(cardBg, clear))
+        fun fadeDown(): GradientDrawable =
+            GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(clear, cardBg))
+        val shadowTop = View(context).apply { background = fadeUp() }
+        val shadowBottom = View(context).apply { background = fadeDown() }
+        shadowTop.visibility = GONE
+        shadowBottom.visibility = GONE
+        fun updateShadows() {
+            val c = scroll.getChildAt(0) ?: return
+            val maxY = c.height - (scroll.height - scroll.paddingTop - scroll.paddingBottom)
+            shadowTop.visibility = if (scroll.scrollY > 0) VISIBLE else GONE
+            shadowBottom.visibility = if (scroll.scrollY < maxY) VISIBLE else GONE
+        }
+        scroll.setOnScrollChangeListener { _, _, _, _, _ -> updateShadows() }
+        list.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> updateShadows() }
+
+        frame.addView(scroll, FrameLayout.LayoutParams(mP, mP))
+        frame.addView(shadowTop, FrameLayout.LayoutParams(mP, shadowH, Gravity.TOP))
+        frame.addView(shadowBottom, FrameLayout.LayoutParams(mP, shadowH, Gravity.BOTTOM))
+        if (stretch) {
+            // fill the parent card instead of a fixed height: the parent
+            // LinearLayout owns the exact height, so weighted stretch is
+            // measured EXACT and never hits the page-ScrollView wrap-quirk.
+            addView(frame, LayoutParams(mP, 0, 1f))
+        } else {
+            addView(frame, LayoutParams(mP, dpi(heightDp)))
+        }
+        return list
+    }
+
+    /** Re-measure was NOT needed: a non-MATCH_PARENT child of a ScrollView
+     *  is measured UNSPECIFIED on this ROM too, so wrap-content rows keep
+     *  their natural height (child 775px in a 422px box = real range).
+     *  The scroll blocker was the outer page ScrollView stealing vertical
+     *  drags at touch-slop; fixed in scrollListBox via
+     *  requestDisallowInterceptTouchEvent on overflow. */
+    protected fun swatchView(sizeDp: Int): View {
+        val v = View(context)
+        val g = GradientDrawable()
+        g.shape = GradientDrawable.RECTANGLE
+        g.cornerRadius = dpf(4)
+        v.background = g
+        v.layoutParams = LayoutParams(dpi(sizeDp), dpi(sizeDp))
+        return v
+    }
+
+    /** Two-line "label + mono package" column for app list rows.
+     *  dim renders the row grey - used for packages already present
+     *  in a target list so the picker still shows and finds them. */
+    protected fun appLine(label: String, pkg: String, dim: Boolean = false): LinearLayout {
+        val col = LinearLayout(context)
+        col.orientation = VERTICAL
+        col.addView(text(label, 14f, parse(if (dim) "#FF727272" else "#FFE0E0E0")))
+        val pv = text(pkg, 11f, parse("#FF727272"), mono = true)
+        pv.setSingleLine(true)
+        pv.ellipsize = android.text.TextUtils.TruncateAt.END
+        col.addView(pv)
+        col.layoutParams = LayoutParams(0, wP, 1f)
+        return col
+    }
+
+    /** Small circular delete chip for list rows. */
+    protected fun iconBtn(symbol: String, onClick: () -> Unit): TextView {
+        val t = TextView(context)
+        t.text = symbol
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+        t.setTextColor(parse("#FFFF8A80"))
+        t.gravity = Gravity.CENTER
+        val g = GradientDrawable()
+        g.shape = GradientDrawable.OVAL
+        g.setColor(parse("#FF2A2A2A"))
+        g.setStroke(dpi(1), parse("#FF4A4A4A"))
+        t.background = g
+        t.layoutParams = LayoutParams(dpi(30), dpi(30))
+        t.setOnClickListener { onClick() }
+        return t
+    }
+
+    /** All installed apps (label by package), excluding the GUI itself.
+     *  Shared by the picker and the rule/suppress row labels. Labels fall
+     *  back to the package name. */
+    protected fun installedAppCatalog(): Map<String, String> = runCatching {
+        val pm = context.packageManager
+        pm.getInstalledApplications(0)
+            .filter { !it.packageName.startsWith("com.bastet.ledgui") }
+            .associate { a ->
+                a.packageName to (
+                    runCatching { pm.getApplicationLabel(a).toString() }.getOrNull()
+                        ?.takeUnless { it.isBlank() } ?: a.packageName
+                    )
+            }
+    }.getOrElse { emptyMap() }
+
+    /** Modal pick of an installed app: searchable list with icon + label +
+     *  package. Already-present packages (exclude) stay VISIBLE but greyed
+     *  with an "(added)" suffix and pick is refused - so the state of the
+     *  target list is obvious and search still finds them. */
+    protected fun pickApp(title: String, exclude: Set<String>, onPick: (String, String) -> Unit) {
+        val pm = context.packageManager
+        val infos = runCatching {
+            pm.getInstalledApplications(0).filter {
+                !it.packageName.startsWith("com.bastet.ledgui")
+            }
+        }.getOrElse { emptyList() }
+        // (ApplicationInfo, label, added)
+        val apps = infos.mapNotNull { a ->
+            val label = runCatching { pm.getApplicationLabel(a).toString() }.getOrNull()
+                ?.takeUnless { it.isBlank() } ?: a.packageName
+            Triple(a, label, a.packageName in exclude)
+        }.sortedWith(compareBy {
+            it.second.lowercase(Locale.US)
+        })
+
+        val search = EditText(context)
+        search.hint = "filter by name or package"
+        search.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+        search.setTextColor(parse("#FFE0E0E0"))
+        search.setHintTextColor(parse("#FF727272"))
+        search.setSingleLine(true)
+        val g = GradientDrawable()
+        g.shape = GradientDrawable.RECTANGLE
+        g.cornerRadius = dpf(8)
+        g.setColor(parse("#FF2A2A2A"))
+        g.setStroke(dpi(1), parse("#FF333333"))
+        search.background = g
+        search.setPadding(dpi(8), dpi(6), dpi(8), dpi(6))
+
+        val list = ListView(context)
+        var shown: List<Triple<android.content.pm.ApplicationInfo, String, Boolean>> = emptyList()
+        val adapter = object : android.widget.BaseAdapter() {
+            override fun getCount() = shown.size
+            override fun getItem(i: Int) = shown[i]
+            override fun getItemId(i: Int) = i.toLong()
+            override fun getView(i: Int, reuse: View?, parent: ViewGroup): View {
+                val (info, label, added) = shown[i]
+                val pkg = info.packageName
+                val boxCol = LinearLayout(context).apply {
+                    orientation = HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(0, dpi(6), 0, dpi(6))
+                }
+                val ic = ImageView(context)
+                ic.setImageDrawable(runCatching { info.loadIcon(pm) }.getOrNull())
+                if (added) ic.alpha = 0.4f
+                ic.layoutParams = LayoutParams(dpi(22), dpi(22))
+                boxCol.addView(ic)
+                boxCol.addView(appLine(
+                    if (added) "${label} (added)" else label, pkg, dim = added))
+                return boxCol
+            }
+        }
+        list.adapter = adapter
+
+        fun refilter() {
+            val q = search.text.toString().trim().lowercase(Locale.US)
+            shown = if (q.isEmpty()) apps
+            else apps.filter { info ->
+                info.first.packageName.contains(q) ||
+                    info.second.lowercase(Locale.US).contains(q)
+            }
+            adapter.notifyDataSetChanged()
+        }
+        search.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) { refilter() }
+            override fun afterTextChanged(s: Editable?) {}
+        })
+        refilter()
+
+        val box = LinearLayout(context).apply {
+            orientation = VERTICAL
+            setPadding(dpi(14), dpi(8), dpi(14), 0)
+            addView(search)
+            addView(list, LayoutParams(mP, dpi(320)))
+        }
+        // Default AlertDialog theme is Material LIGHT: our dark-app text
+        // colors (light-grey labels) would wash out against the white
+        // window and look inverted. Force the dark Material dialog theme.
+        val dctx = android.view.ContextThemeWrapper(context, android.R.style.Theme_Material)
+        val dialog = AlertDialog.Builder(dctx)
+            .setTitle(title)
+            .setView(box)
+            .setNegativeButton("Cancel") { d, _ -> d.dismiss() }
+            .create()
+        list.setOnItemClickListener { _, _, pos, _ ->
+            val t = shown[pos]
+            if (t.third) {
+                android.widget.Toast.makeText(context,
+                    "Already in the list", android.widget.Toast.LENGTH_SHORT).show()
+                return@setOnItemClickListener
+            }
+            dialog.dismiss()
+            onPick(t.first.packageName, t.second)
+        }
+        dialog.show()
+    }
+
+    /** Modal RGB picker (3 sliders + live hex) reused for list entries. */
+    protected fun pickColor(title: String, initial: Triple<Int, Int, Int>, onApply: (Triple<Int, Int, Int>) -> Unit) {
+        var color = initial
+        val sw = swatchView(28)
+        val hexTv = text("", 12f, parse("#FF90CAF9"), mono = true)
+        val box = LinearLayout(context).apply {
+            orientation = VERTICAL
+            setPadding(dpi(4), dpi(4), dpi(4), dpi(4))
+            addView(row(sw))
+            addView(hexTv)
+        }
+        val vals = mutableListOf<TextView>()
+        val channelPaint = listOf(
+            parse("#FFE05A4E"), parse("#FF62B86B"), parse("#FF4E9BE0")
+        )
+        fun comp(i: Int) = when (i) {
+            0 -> color.first; 1 -> color.second; else -> color.third
+        }
+        fun paint() {
+            (sw.background as? GradientDrawable)?.setColor(
+                Color.rgb(color.first, color.second, color.third)
+            )
+            hexTv.text = String.format(Locale.US, "#%02X%02X%02X",
+                color.first, color.second, color.third)
+        }
+        listOf("R", "G", "B").forEachIndexed { i, name ->
+            val vt = text(comp(i).toString(), 13f, parse("#FFE0E0E0"), mono = true)
+            vt.layoutParams = LayoutParams(dpi(36), wP)
+            vals.add(vt)
+            val sl = SliderView(channelPaint[i], comp(i)) { v ->
+                color = when (i) {
+                    0 -> Triple(v, color.second, color.third)
+                    1 -> Triple(color.first, v, color.third)
+                    else -> Triple(color.first, color.second, v)
+                }
+                vals[i].text = comp(i).toString()
+                paint()
+            }
+            sl.layoutParams = LayoutParams(0, dpi(50), 1f)
+            box.addView(row(text(name, 13f, parse("#FF90CAF9"), bold = true), sl, vt))
+        }
+        paint()
+        // Same dark Material dialog theme as the app picker (the stock
+        // light dialog would wash out the dark-app colors).
+        val dctx = android.view.ContextThemeWrapper(context, android.R.style.Theme_Material)
+        AlertDialog.Builder(dctx)
+            .setTitle(title)
+            .setView(box)
+            .setPositiveButton("OK") { _, _ -> onApply(color) }
+            .setNegativeButton("Cancel") { d, _ -> d.dismiss() }
+            .show()
+    }
+
     /** Labeled row of three small numeric fields (cur r,g,b, phase t0, ...).
      *  Homemade: no external number-picker dependency. */
     protected inner class TripleField(label: String, def: Triple<Int, Int, Int>) : LinearLayout(context) {
@@ -721,6 +1016,11 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
          *  attachPreview() - for showColor cards it's the card's own
          *  picker; EventKnobs attaches the standalone color card's. */
         private var previewTarget: RgbPicker? = null
+
+        /** Fired whenever the knobs that change the LIGHT (mode, cur, sync)
+         *  move - lets a rule list repaint its swatches through this
+         *  renderer (the app preset has no own color picker to preview on). */
+        var onDriveChanged: (() -> Unit)? = null
 
         private lateinit var solidCard: LinearLayout
         private lateinit var breathCard: LinearLayout
@@ -850,6 +1150,7 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
             waveT0.setFieldEnabled(0, true)
             waveT0.setFieldEnabled(1, !sync)
             waveT0.setFieldEnabled(2, !sync)
+            onDriveChanged?.invoke()
         }
 
         /** The current triple the active mode actually drives. solid and
@@ -870,6 +1171,17 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
 
         fun refreshPreview() {
             previewTarget?.previewCur = activeCur()
+            onDriveChanged?.invoke()
+        }
+
+        /** The (cur, sync) the renderer's knobs currently drive - the same
+         *  light the chip would show for a given rule color, so rule-list
+         *  swatches can preview through a shared renderer. Same math as the
+         *  Status live swatch, but from the editor's live values. */
+        fun liveDrive(): Pair<Triple<Int, Int, Int>, Boolean> {
+            val sync = (modeNames[mode.get()] == "breath" && brSync.isChecked) ||
+                (modeNames[mode.get()] == "wave" && waveSync.isChecked)
+            return Pair(activeCur(), sync)
         }
 
         private fun syncMode() {
@@ -944,7 +1256,7 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
         showColor: Boolean = true,
         showCap: Boolean = true,
         capLabel: String = "max sec (0 == inf)",
-        colorBuilder: (() -> View)? = null
+        colorBuilder: (LinearLayout.() -> View)? = null
     ) : LinearLayout(context) {
         lateinit var color: RgbPicker
             private set

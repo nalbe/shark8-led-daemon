@@ -169,7 +169,7 @@ private fun render() {
      *  armed event's per-channel current from led.conf: what the chip is
      *  really doing right now. */
     private fun renderRenderer() {
-        val cur = if (led.isArmed) statusCurrent() else null
+        val cur = if (led.isArmed) statusDrive()?.first else null
         val curTxt = cur?.let { "  cur ${it.first},${it.second},${it.third}" } ?: ""
         ledRendererTv.text = if (led.engine.isBlank()) {
             "renderer: (led.status missing - old daemon?)"
@@ -179,10 +179,11 @@ private fun render() {
         ledRendererTv.setTextColor(if (led.engine.isBlank()) parse("#FF909090") else parse("#FFB0BEC5"))
     }
 
-    /** Per-channel current (0..15) the armed event drives, resolved from
-     *  led.conf by status mode/band/engine. wave has no per-channel knob
-     *  in the GUI (chip default full); off = all channels dark. */
-    private fun statusCurrent(): Triple<Int, Int, Int>? {
+    /** Resolve the armed event's drive settings from led.conf by status
+     *  mode/band/engine: the per-channel current (0..15) AND whether the
+     *  event runs SYNC (all channels on the red master PWM). wave has no
+     *  per-channel knob in the GUI (chip default full); off = all dark. */
+    private fun statusDrive(): Pair<Triple<Int, Int, Int>, Boolean>? {
         val c = conf ?: return null
         val active = when (led.mode) {
             "charge" -> when (led.band) {
@@ -191,19 +192,27 @@ private fun render() {
                 "upper" -> c.chargeUpper
                 else -> null
             }
-            "notify" -> if (c.rules.any { it.pkg == led.pkg }) c.notifyAppRender else c.notifyRender
+            "notify" -> when {
+                c.rules.any { it.pkg == led.pkg } ->
+                    c.rules.first { it.pkg == led.pkg }.takeIf { it.custom }
+                        ?.render ?: c.notifyAppRender
+                else -> c.notifyRender
+            }
             "ring" -> c.ringRender
             "voip" -> c.voipRender
             "missed" -> c.missedRender
             "alarm" -> c.alarmRender
             else -> null
         } ?: return null
-        return when (led.engine) {
+        val sync = (led.engine == "breath" && active.brSync) ||
+            (led.engine == "wave" && active.waveSync)
+        val cur = when (led.engine) {
             "solid" -> active.solidCur
             "breath" -> active.brCur
             "off" -> Triple(0, 0, 0)
             else -> Triple(15, 15, 15)
         }
+        return Pair(cur, sync)
     }
 
     private fun renderRoot() {
@@ -387,11 +396,13 @@ private fun updateLedLive() {
          * readback of the instantaneous PWM (regs are write-only). So we
          * show the CONFIG color the daemon armed, scaled by the event's
          * per-channel current (LedSim) - the light the combination
-         * produces. engine in parentheses tells what the chip does. */
-        val cur = if (led.isArmed) statusCurrent() else null
+         * produces. SYNC arms the red master PWM on every channel, so it
+         * is modeled too (per-channel cur ratio tints the color).
+         * engine in parentheses tells what the chip does. */
+        val drive = if (led.isArmed) statusDrive() else null
         val raw = led.color
         val sim = if (led.isArmed) {
-            LedSim.rgbWithCurrent(raw, cur ?: Triple(15, 15, 15))
+            LedSim.rgbWithCurrent(raw, drive?.first ?: Triple(15, 15, 15), drive?.second ?: false)
         } else Triple(-1, -1, -1)
         sw.gradientType = GradientDrawable.LINEAR_GRADIENT
         sw.setColor(

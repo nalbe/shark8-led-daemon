@@ -21,8 +21,41 @@ import java.util.Locale
  * There is NO fallback anywhere: a chip section carries its own timing,
  * nothing is inherited from the base section.
  * [led] carries only daemon/chip globals: logging, imax.
+ *
+ * [rules] entries may carry their OWN full notify preset inline instead
+ * of the shared one:
+ *   pkg = r,g,b , notif_max_sec , mode ,
+ *         solid_cur_r,g,b ,
+ *         breath sync,repeat,cur_r,g,b,rise,hold,fall,offt ,
+ *         wave   sync,t0_r,g,b,repeat,rise,hold,fall,offt
+ * (positional, left-prefix: a broken token stops the tail, the rest fall
+ * back to defaults - same rules as the daemon parser). The daemon
+ * synthesize such lines into a [notify.<pkg>] preset section at load;
+ * color-only lines are legacy and keep resolving to [notify.app].
+ * The pending window (notify_screen_delay_ms) is NOT per-app: it stays a
+ * single shared [notify] value.
  */
-data class Rule(val pkg: String, val r: Int, val g: Int, val b: Int)
+/**
+ * One [rules] entry. Color is always own; everything else is own ONCE the
+ * line carries the extended tail (custom=true, the GUI always writes full
+ * lines for such rules). Legacy color-only lines (custom=false) keep
+ * serializing as "pkg=r,g,b" and resolve to the legacy [notify.app]
+ * preset on the daemon; the parser seeds them from it once so nothing is
+ * lost when the file is next saved (the GUI no longer writes [notify.app]).
+ */
+class Rule(
+    val pkg: String,
+    var r: Int,
+    var g: Int,
+    var b: Int,
+    /** own cap (notif_max_sec, 0 = unlimited) - written only when custom */
+    var maxSec: Long = 0,
+    var render: Render = Render(),
+    var custom: Boolean = false
+) {
+    constructor(pkg: String, r: Int, g: Int, b: Int) :
+        this(pkg, r, g, b, 0, Render(), false)
+}
 
 /** Per-event chip renderer (v4): how ONE event (or charge band)
  *  animates the AW2033. Every chip section owns its own timing; there
@@ -69,7 +102,6 @@ data class LedConf(
     var notifyScreenDelayMs: Long = 60000,
     var notifyColor: Triple<Int, Int, Int> = Triple(255, 150, 150),
     var notifAppMaxSec: Long = 0,
-    var notifAppScreenDelayMs: Long = 60000,
     var ringCapSec: Long = 0,
     var ringColor: Triple<Int, Int, Int> = Triple(255, 255, 255),
     var voipMaxSec: Long = 300,
@@ -175,6 +207,7 @@ data class LedConf(
 
     fun parse(text: String) {
         var section = ""
+        var sawNotifyApp = false
         for (rawLine in text.lineSequence()) {
             val line = rawLine.trim()
             if (line.isEmpty() || line.startsWith("#") || line.startsWith(";")) continue
@@ -190,10 +223,11 @@ data class LedConf(
                 "rules" -> {
                     val i = line.indexOf('=')
                     if (i <= 0) continue
-                    val pkg = line.substring(0, i).trim()
-                    val rgb = parseRgb(line.substring(i + 1)) ?: continue
-                    rules.removeAll { it.pkg == pkg }
-                    rules.add(Rule(pkg, rgb.first, rgb.second, rgb.third))
+                    val rule = parseRuleValue(line.substring(0, i).trim(),
+                                              line.substring(i + 1))
+                        ?: continue
+                    rules.removeAll { it.pkg == rule.pkg }
+                    rules.add(rule)
                 }
                 "charge" -> {
                     val i = line.indexOf('=')
@@ -221,13 +255,13 @@ data class LedConf(
                     }
                 }
                 "notify.app" -> {
+                    sawNotifyApp = true
                     val i = line.indexOf('=')
                     if (i <= 0) continue
                     val k = line.substring(0, i).trim()
                     val v = line.substring(i + 1).trim()
                     when (k) {
                         "notif_max_sec" -> v.toLongOrNull()?.let { notifAppMaxSec = it }
-                        "notify_screen_delay_ms" -> v.toLongOrNull()?.let { notifAppScreenDelayMs = it }
                         "mode" -> parseMode(v)?.let { notifyAppRender.mode = it }
                     }
                 }
@@ -326,10 +360,114 @@ data class LedConf(
                 }
             }
         }
+        /* Legacy migration: color-only rules (custom=false) used to resolve
+         * on the daemon to the shared [notify.app] preset; the GUI no longer
+         * WRITES that section, so those rules are seeded once from it and
+         * promoted to full lines - nothing is lost on the next save. */
+        if (sawNotifyApp) {
+            for (rule in rules) {
+                if (!rule.custom) {
+                    rule.maxSec = notifAppMaxSec
+                    rule.render = notifyAppRender.copy()
+                    rule.custom = true
+                }
+            }
+        }
         if (firstThreshold > secondThreshold) {
             val t = firstThreshold; firstThreshold = secondThreshold; secondThreshold = t
         }
         LedSim.cal = LedSim.Cal(pvwR / 100.0, pvwG / 100.0, pvwB / 100.0, pvwGamma)
+    }
+
+/** Parse one [rules] value ("r,g,b[,cap[,mode[,...]]]").
+ *  The tail is positional and left-prefix exactly like the daemon's:
+ *  the first malformed token stops the stream and its slot plus
+ *  everything after it keep their defaults. A rule whose cap (first
+ *  tail token) is missing or broken stays legacy (custom=false). */
+    private fun parseRuleValue(pkg: String, value: String): Rule? {
+        val t = value.split(',')
+        if (t.size < 3) return null
+        val r = clampColor(t[0].trim().toIntOrNull() ?: return null)
+        val g = clampColor(t[1].trim().toIntOrNull() ?: return null)
+        val b = clampColor(t[2].trim().toIntOrNull() ?: return null)
+        val render = Render()
+        var cap = -1L
+        var stopped = false
+        var i = 3
+
+        fun next(): Long? = if (i < t.size) t[i++].trim().toLongOrNull() else null
+        fun slot(assign: (Long) -> Unit) {
+            if (stopped) return
+            val v = next()
+            if (v == null) stopped = true else assign(v)
+        }
+        fun tripleSlot(assign: (Triple<Int, Int, Int>) -> Unit) {
+            if (stopped) return
+            val a = next() ?: run { stopped = true; return@tripleSlot }
+            val b = next() ?: run { stopped = true; return@tripleSlot }
+            val c = next() ?: run { stopped = true; return@tripleSlot }
+            assign(Triple(a.toInt().coerceIn(0, 15), b.toInt().coerceIn(0, 15),
+                          c.toInt().coerceIn(0, 15)))
+        }
+
+        slot { cap = it }
+        if (!stopped) {
+            if (i < t.size) {
+                val m = t[i].trim()
+                if (m in VALID_MODES) { render.mode = m; i++ } else stopped = true
+            }
+        }
+        tripleSlot { render.solidCur = it }
+        slot { render.brSync = it != 0L }
+        slot { render.brRepeat = it.toInt().coerceIn(0, 15) }
+        tripleSlot { render.brCur = it }
+        slot { render.brRise = it.toInt() }
+        slot { render.brHold = it.toInt() }
+        slot { render.brFall = it.toInt() }
+        slot { render.brOfft = it.toInt() }
+        slot { render.waveSync = it != 0L }
+        tripleSlot { render.waveT0 = Triple(
+            it.first.coerceAtLeast(0), it.second.coerceAtLeast(0), it.third.coerceAtLeast(0)
+        ) }
+        slot { render.waveRepeat = it.toInt().coerceIn(0, 15) }
+        slot { render.waveRise = it.toInt() }
+        slot { render.waveHold = it.toInt() }
+        slot { render.waveFall = it.toInt() }
+        slot { render.waveOfft = it.toInt() }
+
+        val custom = cap >= 0
+        return Rule(
+            pkg, r, g, b,
+            maxSec = if (custom) cap else 0L,
+            render = render,
+            custom = custom
+        )
+    }
+
+    /** One [rules] line: color always, the full preset when custom. */
+    private fun ruleLine(rule: Rule): String {
+        val sb = StringBuilder()
+        sb.append(rule.pkg).append('=')
+            .append(rule.r).append(',').append(rule.g).append(',').append(rule.b)
+        if (rule.custom) {
+            val r = rule.render
+            sb.append(',').append(rule.maxSec)
+            sb.append(',').append(r.mode)
+            sb.append(',').append(tripleClamp(r.solidCur, 0, 15))
+            sb.append(',').append(if (r.brSync) 1 else 0)
+            sb.append(',').append(r.brRepeat.coerceIn(0, 15))
+            sb.append(',').append(tripleClamp(r.brCur, 0, 15))
+            sb.append(',').append(r.brRise).append(',').append(r.brHold)
+                .append(',').append(r.brFall).append(',').append(r.brOfft)
+            sb.append(',').append(if (r.waveSync) 1 else 0).append(',')
+                .append(r.waveT0.first.coerceAtLeast(0)).append(',')
+                .append(r.waveT0.second.coerceAtLeast(0)).append(',')
+                .append(r.waveT0.third.coerceAtLeast(0))
+            sb.append(',').append(r.waveRepeat.coerceIn(0, 15))
+            sb.append(',').append(r.waveRise).append(',').append(r.waveHold)
+                .append(',').append(r.waveFall).append(',').append(r.waveOfft)
+        }
+        return sb.toString()
     }
 
     fun render(): String {
@@ -339,6 +477,8 @@ data class LedConf(
         sb.append("#\n")
         sb.append("# [suppress] one package per line - never lights the LED\n")
         sb.append("# [rules]    pkg=r,g,b  (0-255 per channel)\n")
+        sb.append("#            + optional own preset tail: cap, mode,\n")
+        sb.append("#            solid_cur, breath, wave (see header for layout)\n")
         sb.append("# [charge]   thresholds ONLY; each band owns color/timing\n")
         sb.append("# [notify]   shared behavior: notif_max_sec, default color\n")
         sb.append("# [ring]     incoming call rainbow: max_sec, base color\n")
@@ -355,8 +495,7 @@ data class LedConf(
         for (p in suppress) sb.append(p).append('\n')
         sb.append("\n[rules]\n")
         for (rule in rules) {
-            sb.append(rule.pkg).append('=').append(rule.r).append(',')
-                .append(rule.g).append(',').append(rule.b).append('\n')
+            sb.append(ruleLine(rule)).append('\n')
         }
         sb.append("\n[charge]\n")
         sb.append("first_threshold=").append(firstThreshold).append('\n')
@@ -369,11 +508,6 @@ data class LedConf(
         sb.append("notify_screen_delay_ms=").append(notifyScreenDelayMs).append('\n')
         sb.append("default_color=").append(rgb(notifyColor)).append('\n')
         appendMode(sb, "notify", notifyRender)
-        sb.append("\n[notify.app]\n")
-        sb.append("notif_max_sec=").append(notifAppMaxSec).append('\n')
-        sb.append("notify_screen_delay_ms=").append(notifAppScreenDelayMs).append('\n')
-        appendMode(sb, "notify.app", notifyAppRender)
-        appendRenderChips(sb, "notify.app", notifyAppRender)
         sb.append("\n[ring]\n")
         sb.append("max_sec=").append(ringCapSec).append('\n')
         sb.append("color=").append(rgb(ringColor)).append('\n')

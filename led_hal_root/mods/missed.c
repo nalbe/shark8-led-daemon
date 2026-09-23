@@ -111,9 +111,19 @@ static long missed_next_wake(void)
 /* ---------------- NLS events ---------------- */
 
 /* MISSED_ON <id>: the bridge saw a dialer missed-call tombstone post.
- * A repost of one already showing just re-arms idempotently. */
+ * A repost of one already showing just re-arms idempotently.
+ * Gated on the system "Blink light" toggle: the missed tombstone IS a
+ * notification (the dialer's own post), so it must obey
+ * notification_light_pulse like the generic pool - stock SystemUI turns
+ * every notification LED off with it. The disarming side needs no local
+ * handling: the core's PULSE 0 branch calls disarm_notification() which
+ * clears any cur_pkg, armed missed included. */
 void missed_on(void)
 {
+    if (!pulse_on()) {
+        LOGI("missed: notification light off, tombstone dropped");
+        return;
+    }
     missed_paint();
 }
 

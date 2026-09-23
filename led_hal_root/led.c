@@ -112,7 +112,7 @@ static int read_triple(const char *sec, const char *key,
 static void led_solid_rgb(const char *sec, int r, int g, int b)
 {
     aw_chip *c = led_hw();
-    char ss[40];
+    char ss[128];
     int cur[3];
     snprintf(ss, sizeof(ss), "%s.solid", sec);
     read_triple(ss, "cur", cur, 15, 15, 15, 0, 15);
@@ -136,7 +136,7 @@ static void led_solid_rgb(const char *sec, int r, int g, int b)
 static void led_breathe_rgb(const char *sec, int r, int g, int b)
 {
     aw_chip *c = led_hw();
-    char ss[40];
+    char ss[128];
     snprintf(ss, sizeof(ss), "%s.breath", sec);
     long rise = conf_get_int(ss, "rise", DEF_T_RISE);
     long hold = conf_get_int(ss, "hold", DEF_T_HOLD);
@@ -163,7 +163,7 @@ static void led_breathe_rgb(const char *sec, int r, int g, int b)
 static void led_wave_rgb(const char *sec, int r, int g, int b)
 {
     aw_chip *c = led_hw();
-    char ss[40];
+    char ss[128];
     snprintf(ss, sizeof(ss), "%s.wave", sec);
     long rise = conf_get_int(ss, "rise", DEF_T_RISE);
     long hold = conf_get_int(ss, "hold", DEF_T_HOLD);

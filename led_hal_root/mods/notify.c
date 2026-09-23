@@ -107,11 +107,12 @@ void arm_notification_ex(struct notif_state *st, const char *pkg, int test)
         return;
     }
     int r, g, b;
-    /* rule-matched packages run the [notify.app] preset (own renderer,
-     * cap; color comes from the rule), everything else runs the shared
-     * [notify] default preset. */
+    /* rule-matched packages run their OWN preset when the rule carries an
+     * extended tail (synthetic [notify.<pkg>]), otherwise the legacy
+     * shared [notify.app]; everything else runs the shared [notify]
+     * default preset. Color always comes from the rule. */
     int app  = rgb_for(pkg, &r, &g, &b);
-    const char *sec = app ? "notify.app" : "notify";
+    const char *sec = app ? conf_notify_sec(pkg) : "notify";
     LOGI("arm detect: %s -> [%s] rgb=%d,%d,%d (rules|default)",
          pkg, sec, r, g, b);
     g_applied_band[0] = '\0';       /* LEDs taken over: force reapply later */

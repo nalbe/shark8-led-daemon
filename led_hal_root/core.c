@@ -603,11 +603,18 @@ int main(int argc, char **argv)
         }
         if (g_clear) {
             g_clear = 0;
-            /* GUI flipped the "Notification light" toggle OFF: it tells us
-             * directly (belt-and-braces - the NLS ContentObserver will
-             * forward the same flip as PULSE 0 over the socket), so note
-             * the state and kill whatever notification LED is showing. */
-            pulse_note(0);
+            /* GUI "Disarm" / test hook: drop the armed LED and the pool.
+             * DELIBERATELY no pulse_note(0) here - the toggle state
+             * belongs to Settings.System and may only arrive as the
+             * bridge's PULSE event (live change or connect replay).
+             * Writing the state here desynced the gate from the real
+             * setting: every Disarm press with the toggle actually on
+             * flipped the daemon to "off forever" (until the next real
+             * toggle or a reconnect replay) and then dropped every
+             * notification. The old in-GUI toggle that this "belt-and-
+             * braces" wrote for is gone since v2.17 - the system setting
+             * only ever changes through the settings app, and the bridge
+             * observer catches that on its own. */
             queue_clear();
             disarm_notification(&g_st, "sigusr2");
         }
