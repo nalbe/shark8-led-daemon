@@ -1,6 +1,6 @@
 id=led_hal_root
 name=Notification LED daemon (AW2033)
-version=3.5.3
-versionCode=28
+version=3.6
+versionCode=29
 author=Bastet
 description=Notification LED for Blackview Shark8 on ported Pixel ROM. Stock MTK lights HAL cannot flash on this hardware. A single event-driven daemon (chgd) drives the AW2033 RGB LED through the chip register node. Every event owns its own renderer (mode=off|solid|breath|wave, color, chip timing) in led.conf; breathing, traveling-wave and solid patterns run inside the chip. Notifications arrive over the standalone headless NotifyBridge app (com.bastet.notifybridge, abstract Unix socket, works on non-debuggable builds where event-log tags never fire), charge state comes from the same bridge as CHG events (BATTERY_CHANGED), no sysfs reads, no polling loops. GUI (com.bastet.ledgui) is an optional configurator.

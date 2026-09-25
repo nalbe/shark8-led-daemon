@@ -1,5 +1,5 @@
 {
-  "_comment": "notifybridge config shipped with the led_hal_root module. Deployed to /data/local/tmp/notifybridge.json by customize.sh (module install) and install_core.cmd (dev apply). Sections: notifications (out for ENQ/CAN/RING/VOIP/MISSED; the dialer package is fully classified by the bridge - live calls as RING, missed tombstones as MISSED - and never emitted as a raw ENQ), broadcasts (screen polarity + snapshot replay + battery charge state), settings (the 'Blink light' gate: Settings.System.notification_light_pulse forwarded as PULSE 0/1 instantly, current polarity replayed to every socket on connect like screen). Wire contract to the daemon: ENQ/CAN/RING_ON/OFF/VOIP_ON/OFF/MISSED_ON/OFF/SCREEN 0|1/CHG <status> <level>/PULSE 0|1.",
+  "_comment": "notifybridge config shipped with the led_hal_root module. Deployed to /data/local/tmp/notifybridge.json by customize.sh (module install) and install_core.cmd (dev apply). Sections: notifications (out for ENQ/CAN/CALL/VOIP/MISSED; live call classification runs on ANY package by markers - category CALL / 'call'-ish channel / answer-decline actions. Which package renders as RING_* (telephony dialers) vs VOIP_* (messenger apps) is chosen HERE, per route: a live call from a package NOT listed below sends nothing to the bus), broadcasts (screen polarity + snapshot replay + battery charge state), settings (the 'Blink light' gate: Settings.System.notification_light_pulse forwarded as PULSE 0/1 instantly, current polarity replayed to every socket on connect like screen). Wire contract to the daemon: ENQ/CAN/RING_ON/OFF/VOIP_ON/OFF/MISSED_ON/OFF/SCREEN 0|1/CHG <status> <level> <plugged>/PULSE 0|1.",
   "sinks": [
     { "type": "socket", "name": "notify_bus" },
     { "type": "logcat", "name": "log" }
@@ -9,17 +9,45 @@
 
   "notifications": {
     "enabled": true,
-    "calls": {
-      "dialer": "com.google.android.dialer",
-      "voip": ["org.telegram.messenger", "com.whatsapp", "com.viber.voip", "org.thoughtcrime.securesms", "com.snapchat", "com.google.android.apps.tachyon"]
-    },
     "out": [
       { "when": "notify.posted", "to": "notify_bus", "line": "ENQ $pkg $id" },
       { "when": "notify.removed", "to": "notify_bus", "line": "CAN $pkg $id" },
-      { "when": "ring.on", "to": "notify_bus", "line": "RING_ON $incoming" },
-      { "when": "ring.off", "to": "notify_bus", "line": "RING_OFF" },
-      { "when": "voip.on", "to": "notify_bus", "line": "VOIP_ON $pkg" },
-      { "when": "voip.off", "to": "notify_bus", "line": "VOIP_OFF $pkg" },
+      { "when": "call.on", "pkg": "com.google.android.dialer", "to": "notify_bus", "line": "RING_ON $incoming" },
+      { "when": "call.off", "pkg": "com.google.android.dialer", "to": "notify_bus", "line": "RING_OFF" },
+      { "when": "call.on", "pkg": "com.android.dialer", "to": "notify_bus", "line": "RING_ON $incoming" },
+      { "when": "call.off", "pkg": "com.android.dialer", "to": "notify_bus", "line": "RING_OFF" },
+      { "when": "call.on", "pkg": "com.android.incallui", "to": "notify_bus", "line": "RING_ON $incoming" },
+      { "when": "call.off", "pkg": "com.android.incallui", "to": "notify_bus", "line": "RING_OFF" },
+      { "when": "call.on", "pkg": "com.android.contacts", "to": "notify_bus", "line": "RING_ON $incoming" },
+      { "when": "call.off", "pkg": "com.android.contacts", "to": "notify_bus", "line": "RING_OFF" },
+      { "when": "call.on", "pkg": "com.samsung.android.dialer", "to": "notify_bus", "line": "RING_ON $incoming" },
+      { "when": "call.off", "pkg": "com.samsung.android.dialer", "to": "notify_bus", "line": "RING_OFF" },
+      { "when": "call.on", "pkg": "com.oneplus.dialer", "to": "notify_bus", "line": "RING_ON $incoming" },
+      { "when": "call.off", "pkg": "com.oneplus.dialer", "to": "notify_bus", "line": "RING_OFF" },
+      { "when": "call.on", "pkg": "com.oppo.dialer", "to": "notify_bus", "line": "RING_ON $incoming" },
+      { "when": "call.off", "pkg": "com.oppo.dialer", "to": "notify_bus", "line": "RING_OFF" },
+      { "when": "call.on", "pkg": "com.huawei.contacts", "to": "notify_bus", "line": "RING_ON $incoming" },
+      { "when": "call.off", "pkg": "com.huawei.contacts", "to": "notify_bus", "line": "RING_OFF" },
+      { "when": "call.on", "pkg": "org.telegram.messenger", "to": "notify_bus", "line": "VOIP_ON $pkg" },
+      { "when": "call.off", "pkg": "org.telegram.messenger", "to": "notify_bus", "line": "VOIP_OFF $pkg" },
+      { "when": "call.on", "pkg": "com.whatsapp", "to": "notify_bus", "line": "VOIP_ON $pkg" },
+      { "when": "call.off", "pkg": "com.whatsapp", "to": "notify_bus", "line": "VOIP_OFF $pkg" },
+      { "when": "call.on", "pkg": "com.whatsapp.w4b", "to": "notify_bus", "line": "VOIP_ON $pkg" },
+      { "when": "call.off", "pkg": "com.whatsapp.w4b", "to": "notify_bus", "line": "VOIP_OFF $pkg" },
+      { "when": "call.on", "pkg": "com.viber.voip", "to": "notify_bus", "line": "VOIP_ON $pkg" },
+      { "when": "call.off", "pkg": "com.viber.voip", "to": "notify_bus", "line": "VOIP_OFF $pkg" },
+      { "when": "call.on", "pkg": "com.skype.m2", "to": "notify_bus", "line": "VOIP_ON $pkg" },
+      { "when": "call.off", "pkg": "com.skype.m2", "to": "notify_bus", "line": "VOIP_OFF $pkg" },
+      { "when": "call.on", "pkg": "com.facebook.orca", "to": "notify_bus", "line": "VOIP_ON $pkg" },
+      { "when": "call.off", "pkg": "com.facebook.orca", "to": "notify_bus", "line": "VOIP_OFF $pkg" },
+      { "when": "call.on", "pkg": "com.google.android.apps.meetings", "to": "notify_bus", "line": "VOIP_ON $pkg" },
+      { "when": "call.off", "pkg": "com.google.android.apps.meetings", "to": "notify_bus", "line": "VOIP_OFF $pkg" },
+      { "when": "call.on", "pkg": "org.thoughtcrime.securesms", "to": "notify_bus", "line": "VOIP_ON $pkg" },
+      { "when": "call.off", "pkg": "org.thoughtcrime.securesms", "to": "notify_bus", "line": "VOIP_OFF $pkg" },
+      { "when": "call.on", "pkg": "com.discord", "to": "notify_bus", "line": "VOIP_ON $pkg" },
+      { "when": "call.off", "pkg": "com.discord", "to": "notify_bus", "line": "VOIP_OFF $pkg" },
+      { "when": "call.on", "pkg": "us.zoom.videomeetings", "to": "notify_bus", "line": "VOIP_ON $pkg" },
+      { "when": "call.off", "pkg": "us.zoom.videomeetings", "to": "notify_bus", "line": "VOIP_OFF $pkg" },
       { "when": "missed.on", "to": "notify_bus", "line": "MISSED_ON $id" },
       { "when": "missed.off", "to": "notify_bus", "line": "MISSED_OFF $id" }
     ]

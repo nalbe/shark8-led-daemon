@@ -1,8 +1,8 @@
 #!/system/bin/sh
-# led_hal_root v3.5.3 installer hook (KernelSU / Magisk compatible)
+# led_hal_root v3.6 installer hook (KernelSU / Magisk compatible)
 
 ui_print "- ==============================="
-ui_print "- Notification LED daemon v3.5.3"
+ui_print "- Notification LED daemon v3.6"
 ui_print "- AW2033 breathing LED, Shark8"
 ui_print "- ==============================="
 

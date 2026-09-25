@@ -9,6 +9,40 @@ out of here:
 - the AW2033 chip controller and `awctl` live in the **aw2033-driver** repo
   (this repo ships only the prebuilt `libaw2033.a`)
 
+## Revision: module ships bridge v7 - call classification is route-driven, old config incompatible (2026-09-25, v3.6)
+
+The notify-bridge v7 rework moved the SIM-vs-VOIP decision out of the
+bridge into the config: live calls are classified on ANY package by
+markers (category CALL / "call"-ish channel / answer-decline actions)
+as a single `call.on`/`call.off` event, misses stay `missed.on`/`off`.
+The old `calls.dialer`/`calls.voip` package lists and the
+`ring.*`/`voip.*` event split are gone - a stale v6 config against the
+v7 bridge silently loses every call: `calls` is ignored, `ring.on`
+routes are dropped at parse, and no `RING_ON`/`VOIP_ON` ever reaches
+the daemon (a missed tombstone would still work - `missed.on` was
+already v6 vocabulary).
+
+1. **Bridge v7.0.0 (code 7) in the module.** `notifybridge-release.apk`
+   rebuilt from the notify-bridge repo's v7 rework: single call
+   classifier by markers, `callIncoming` per live call, `hasLiveCall()`
+   suppress gate replaces the dialer skip (no package list needed - a
+   package inside a live call sends no raw `notify.posted`).
+2. **`module/notifybridge.json` rewritten for per-package routing.**
+   One `call.on`/`call.off` pair per package: 8 telephony dialers
+   (`com.google.android.dialer`, AOSP, incallui, contacts, Samsung,
+   OnePlus, OPPO, Huawei) render as `RING_ON $incoming`/`RING_OFF`;
+   10 messengers (Telegram, WhatsApp, WhatsApp Business, Viber, Skype,
+   Messenger, Meet, Signal, Discord, Zoom) as
+   `VOIP_ON $pkg`/`VOIP_OFF $pkg`; a live call from any other package
+   has no route and sends nothing. `notify.posted`/`removed` keep
+   `pkg: "*"` (implicit) so ENQ/CAN are unchanged.
+3. **Config is incompatible with the v6 bridge** (and the v6 config
+   with the v7 bridge) - hence the version bump: 3.5.3 -> 3.6,
+   versionCode 28 -> 29. Upgrade the whole module zip, do not hand-mix
+   an old `notifybridge.json` with the new APK.
+4. Docs: module.prop, customize.sh banner, README (download link,
+   notification-transport section), PATCHNOTES.
+
 ## Revision: module ships bridge v6 again (2026-09-23, v3.5.3)
 
 The v3.5 missed-call rework (pure bridge events, `mods/missed.c`) needs the

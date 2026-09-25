@@ -37,7 +37,7 @@ only), `install_core.cmd` (build + deploy to device), `install_gui.cmd`
 
 ## Install
 
-1. Download [`led_hal_root-v3.5.3.zip`](https://github.com/nalbe/shark8-led-daemon/releases/latest) (flashable KernelSU module)
+1. Download [`led_hal_root-v3.6.zip`](https://github.com/nalbe/shark8-led-daemon/releases/latest) (flashable KernelSU module)
 2. Flash in KernelSU Manager -> Modules -> Install from storage
 3. `customize.sh` installs both apps automatically (`pm install -r`,
    non-fatal on failure):
@@ -138,7 +138,12 @@ module rides inside the zip as `module/notifybridge.json`
 `customize.sh` on flash and `install_core.cmd` on dev-apply, always
 overwritten like `led.conf`): the ENQ/CAN/RING/VOIP/MISSED/SCREEN/PULSE rule set
 plus the `notification_light_pulse` setting watcher that powers the
-blink-light gate. The full rule language is configurable - see the
+blink-light gate. Call classification runs on any package by bridge
+markers (category CALL / call channel / answer-decline actions) - the
+config routes each package to `RING_*` (telephony dialers) or
+`VOIP_*` (messengers) with one `call.on`/`call.off` pair per package,
+so a live call from an unlisted package sends nothing to the bus. The
+full rule language is configurable - see the
 notify-bridge repo. The wire format the daemon expects:
 
 ```
