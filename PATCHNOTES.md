@@ -9,6 +9,33 @@ out of here:
 - the AW2033 chip controller and `awctl` live in the **aw2033-driver** repo
   (this repo ships only the prebuilt `libaw2033.a`)
 
+## Revision: module ships bridge v7.1 - flat inline routes, old config incompatible (2026-09-25, v3.6.1)
+
+The notify-bridge v7.1 rework turned `broadcasts` and `settings` into the
+same self-contained-route shape as `notifications`: each route carries its
+trigger inline (`action`/`event`/`polarity`/`snapshot`/`fields`) plus
+`to`/`line`, one intent action or settings key can fan out over several
+routes, and the old `when`/per-entry `out` nesting is gone. The v3.6
+shipped config (`when: "call.on"` etc.) does not parse under v7.1: routes
+are dropped at load with a warning, so calls/notifications silently go
+dark against the new bridge - hence the bump.
+
+1. **Bridge v7.1.0 (code 7) in the module.** `notifybridge-release.apk`
+   rebuilt from the notify-bridge repo's v7.1 rework: `notifications.out`
+   routes now key on `action: posted|removed` + explicit `category`
+   (`"*"` / `call` / `missed_call`), broadcasts/settings fan out inline.
+2. **`module/notifybridge.json` rewritten to the v7.1 schema.** ENQ/CAN
+   catch `category: "*"`, per-package call routes carry `category: "call"`
+   (RING for dialers, VOIP for messengers), missed routes use
+   `category: "missed_call"`; SCREEN/CHG/PULSE broadcasts keep one inline
+   route each. Same wire contract as v3.6 - RING_ON/VOIP_ON/MISSED_ON
+   lines are unchanged, only the config shape moved.
+3. **Config is incompatible with the v6/v7.0 bridge** and a v6/v7.0 config
+   is silently degraded under v7.1 - upgrade the whole module zip, do not
+   hand-mix an old `notifybridge.json` with the new APK.
+4. v3.6.1 / versionCode 30; docs bumped (module.prop, customize.sh
+   banner, README download link, PATCHNOTES).
+
 ## Revision: module ships bridge v7 - call classification is route-driven, old config incompatible (2026-09-25, v3.6)
 
 The notify-bridge v7 rework moved the SIM-vs-VOIP decision out of the
