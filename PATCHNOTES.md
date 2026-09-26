@@ -9,6 +9,35 @@ out of here:
 - the AW2033 chip controller and `awctl` live in the **aw2033-driver** repo
   (this repo ships only the prebuilt `libaw2033.a`)
 
+## Revision: one shared [sec.pattern] chip preset for breath and wave (2026-09-26, v3.7.0)
+
+`breath` and `wave` each owned a full chip section with the same keys
+(`repeat`, `cur_r/cur_g/cur_b`, `rise/hold/fall/offt`, `sync`) - the timing
+was written twice and could drift apart between the two modes of the same
+event. Both animated modes now read one `[sec.pattern]` preset; `t0` is the
+only wave-specific key left in it.
+
+1. **`led.c` reads `[sec.pattern]` first** (`led_pattern_sec()`), falling
+   back to the legacy `[sec.breath]` / `[sec.wave]` section when the pattern
+   section is absent. An old `led.conf` therefore keeps its exact previous
+   behavior - no migration needed, no daemon restart risk.
+2. **`[rules]` tails take a named `pattern` block** instead of the two
+   positional breath/wave blobs:
+   `pkg=r,g,b[,cap[,mode[,solid_cur,pattern,sync,repeat,cur r,g,b,rise,hold,fall,offt,t0 r,g,b]]]`.
+   The old positional tail still parses (`tail_tokens() == 12` heuristic)
+   and keeps its legacy sections, so a v3.6 config stays valid until the
+   GUI rewrites the file.
+3. **GUI 1.3 (code 4): one "Pattern params" card** for both animated modes
+   instead of separate breath/wave cards, `t0` hidden outside wave mode, and
+   Status/Notification swatches read `patternCur` / `patternSync` (same math
+   the chip gets). The GUI writes the v5 schema; the daemon still reads v3.
+4. **`module/led.conf` migrated** to the shared preset (charge bands), and
+   the README documents the preset plus a warning that `sync=1` means no
+   per-channel PWM control.
+5. v3.7.0 / versionCode 31; docs bumped (module.prop, customize.sh banner,
+   README download link, PATCHNOTES). `led_gui-release.apk` and `chgd`
+   rebuilt.
+
 ## Revision: module ships bridge v7.1 - flat inline routes, old config incompatible (2026-09-25, v3.6.1)
 
 The notify-bridge v7.1 rework turned `broadcasts` and `settings` into the
