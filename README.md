@@ -19,6 +19,16 @@ The AW2033 chip controller is also external: the packed `libaw2033.a` +
 [aw2033-driver](https://github.com/nalbe/aw2033-driver) repo that this
 project ships (the chip driver and the `awctl` CLI are built there).
 
+> **breath & wave are not "color + brightness".** They run on the chip's
+> per-channel pattern engines that free-run on their own timing, so at
+> different PWM/current levels channels drift out of phase - **without
+> `sync=1` the mix collapses into cacophony**. Turning `sync=1` on locks
+> all three channels to the master (red), but then the rgb PWM you write
+> is ignored and color is only the per-channel `cur` ratio - **with sync
+> there is no per-channel PWM control**. How to set them up is described
+> below under "The daemon" (chip sections and the `sync` key in
+> `led.conf`).
+
 ## What is in this repo
 
 ```
@@ -63,12 +73,12 @@ asleep in idle.
 ### Events and renderers
 
 Any event can use any hardware renderer. Each event owns its own
-`[section]` in `led.conf` with `mode=off|solid|breath|wave`, and each
-renderer's chip tuning lives in its own `[section.solid]`,
-`[section.breath]`, `[section.wave]` sub-sections - per-channel current
-(`cur`), `rise/hold/fall/offt` timing, breath repeat count and the wave
-phase offsets `t0=r,g,b` (the staggering that produces the traveling
-rainbow). Timing is owned by the chip sections;
+`[section]` in `led.conf` with `mode=off|solid|breath|wave`. Solid current
+lives in `[section.solid]`; breath and wave share one `[section.pattern]`
+preset with `repeat`, `cur_r/cur_g/cur_b`, `rise/hold/fall/offt`, `sync`,
+and the wave-only `t0=r,g,b` phase offsets (the staggering that produces
+the traveling rainbow). The daemon also accepts the legacy
+`[section.breath]`/`[section.wave]` sections for migration.
 
 Events:
 
@@ -81,8 +91,9 @@ Events:
   on SIGALRM/inotify (config edit) from the last bridge state. The
   optional plugged bit gates the band: `plugged=0` (broadcast says no
   source is attached) forces "none".
-- **notification** - two presets: `[notify]` for apps without a rule,
-  `[notify.app]` for apps that have a `[rules]` color entry
+- **notification** - `[notify]` is the shared preset for apps without a
+  rule; a `[rules]` entry with a custom tail gets its own synthesized preset,
+  while color-only entries retain the legacy `[notify.app]` fallback
 - **ring** - SIM/dialer calls, incoming and outgoing
 - **voip** - messenger calls (any app the bridge classifies as a call
   notification - category CALL / call channel)

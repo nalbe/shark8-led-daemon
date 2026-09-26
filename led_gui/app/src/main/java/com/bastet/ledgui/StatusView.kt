@@ -204,11 +204,10 @@ private fun render() {
             "alarm" -> c.alarmRender
             else -> null
         } ?: return null
-        val sync = (led.engine == "breath" && active.brSync) ||
-            (led.engine == "wave" && active.waveSync)
+        val sync = (led.engine == "breath" || led.engine == "wave") && active.patternSync
         val cur = when (led.engine) {
             "solid" -> active.solidCur
-            "breath" -> active.brCur
+            "breath", "wave" -> active.patternCur
             "off" -> Triple(0, 0, 0)
             else -> Triple(15, 15, 15)
         }

@@ -15,7 +15,7 @@
  *               behaves exactly as before (shared [notify.app] preset).
  *   [charge]    first_threshold / second_threshold (%) ONLY - each band
  *               owns its renderer: [charge.lower|middle|upper] mode=
- *               color= plus the [charge.<band>.solid/breath/wave] chip
+ *               color= plus the [charge.<band>.solid/pattern] chip
  *               sections (timing = chip-owned)
  *   [notify]    behavior for apps WITHOUT a [rules] entry:
  *               notif_max_sec (0 = unlimited), default_color r,g,b,
@@ -26,15 +26,14 @@
  *   [ring]      incoming-call rainbow: max_sec + v3 color
  *   [voip]      messenger-call rainbow: max_sec + v3 color
  *
- * v3 per-event renderer sections (owned by led.c through the generic kv
+ * v5 per-event renderer sections (owned by led.c through the generic kv
  * table, one per event sec = charge|notify|missed|alarm|ring|voip):
  *   [sec]          mode=off|solid|breath|wave
  *   [sec.solid]    cur=r,g,b (0..15)
- *   [sec.breath]   repeat, cur_r/cur_g/cur_b + rise/hold/fall/offt (owned
- *                  by the chip section itself)
- *   [sec.wave]     t0=r,g,b phase offsets, repeat + rise/hold/fall/offt
+ *   [sec.pattern]  repeat, cur_r/cur_g/cur_b, rise/hold/fall/offt, sync,
+ *                  t0=r,g,b (wave only)
+ * Legacy [sec.breath]/[sec.wave] sections are accepted by the daemon.
  *   [led]          chip/daemon globals only: logging, imax
- *                  imax
  *
  * Every other key=value pair anywhere in the file lands in a generic
  * key-value table (conf_get_str / conf_get_int). That is how mods own
@@ -75,9 +74,9 @@
 #define MAX_RULES 96
 
 /* generic key-value store for mod-owned sections (e.g. [ring],
- * [charge.solid], [charge.breath], [charge.wave], ...) plus the synthetic
+ * [charge.solid], [charge.pattern], ...) plus the synthetic
  * per-rule [notify.<pkg>] presets. sec holds long section names
- * ("notify.<very.long.pkg>.breath"), val holds long [rules] values. */
+ * ("notify.<very.long.pkg>.pattern"), val holds long [rules] values. */
 #define MAX_KV   2560
 struct kv { char sec[128]; char key[32]; char val[192]; };
 
@@ -253,6 +252,29 @@ static int tok_int(const char **p, long *out)
     return 1;
 }
 
+static int tok_literal(const char **p, const char *want)
+{
+    const char *s = *p;
+    if (!s) return 0;
+    const char *end = strchr(s, ',');
+    size_t n = end ? (size_t)(end - s) : strlen(s);
+    if (strlen(want) != n || strncmp(s, want, n)) return 0;
+    *p = end ? end + 1 : NULL;
+    return 1;
+}
+
+static int tail_tokens(const char *p)
+{
+    int n = 0;
+    while (p && *p) {
+        const char *end = strchr(p, ',');
+        n++;
+        if (!end) break;
+        p = end + 1;
+    }
+    return n;
+}
+
 /* mode word ("off"|"solid"|"breath"|"wave"), same left-prefix cursor */
 static int tok_mode(const char **p, char out[8])
 {
@@ -270,18 +292,15 @@ static int tok_mode(const char **p, char out[8])
     return 0;
 }
 
-/* The extended tail is  r,g,b, cap, mode, solid_cur, breath, wave
- * - every slot after the first three is optional; the modules read the
- * synthesized keys exactly as they read a hand-written [notify.*] block:
- *   [notify.<pkg>]        notif_max_sec / mode
- *   [notify.<pkg>.solid]  cur=r,g,b
- *   [notify.<pkg>.breath] sync, repeat, cur_r/g/b, rise, hold, fall, offt
- *   [notify.<pkg>.wave]   same + t0=r,g,b
- * Absent keys fall back to module defaults, so a partially filled tail
- * degrades gracefully. A rule whose tail has no cap (first token) keeps
- * the legacy [notify.app] fallback instead of the synthetic section.
- * The pending window (notify_screen_delay_ms) is NOT per-app: it stays a
- * single shared [notify] value. */
+/* The extended tail is  r,g,b, cap, mode, solid_cur, pattern, ...
+ * New custom rules use one shared pattern preset for breath and wave:
+ *   [notify.<pkg>]          notif_max_sec / mode
+ *   [notify.<pkg>.solid]    cur=r,g,b
+ *   [notify.<pkg>.pattern]  sync, repeat, cur_r/g/b, rise, hold, fall, offt,
+ *                           t0=r,g,b
+ * The old positional breath/wave tail is accepted for migration and keeps
+ * its two legacy sections so existing behavior is not lost until the GUI
+ * rewrites the file. */
 static void rule_synth(const char *pkg, const char *tail)
 {
     const char *p = tail;
@@ -289,30 +308,46 @@ static void rule_synth(const char *pkg, const char *tail)
     long cap = -1;
     char mode[8] = "";
     long scur[3] = { -1, -1, -1 };
+    long psync = -1, prep = -1, pcur[3] = { -1, -1, -1 };
+    long prise = -1, phold = -1, pfall = -1, pofft = -1;
+    long pt0[3] = { -1, -1, -1 };
     long bsync = -1, brep = -1, bcur[3] = { -1, -1, -1 };
     long brise = -1, bhold = -1, bfall = -1, bofft = -1;
     long wsync = -1, wt0[3] = { -1, -1, -1 }, wrep = -1;
     long wrise = -1, whold = -1, wfall = -1, wofft = -1;
+    int shared = 0;
 
     if (tok_int(&p, &v)) cap = v;
     tok_mode(&p, mode);
     for (int i = 0; i < 3 && tok_int(&p, &v); i++) scur[i] = v;
-    if (tok_int(&p, &v)) bsync = v;
-    if (tok_int(&p, &v)) brep = v;
-    for (int i = 0; i < 3 && tok_int(&p, &v); i++) bcur[i] = v;
-    if (tok_int(&p, &v)) brise = v;
-    if (tok_int(&p, &v)) bhold = v;
-    if (tok_int(&p, &v)) bfall = v;
-    if (tok_int(&p, &v)) bofft = v;
-    if (tok_int(&p, &v)) wsync = v;
-    for (int i = 0; i < 3 && tok_int(&p, &v); i++) wt0[i] = v;
-    if (tok_int(&p, &v)) wrep = v;
-    if (tok_int(&p, &v)) wrise = v;
-    if (tok_int(&p, &v)) whold = v;
-    if (tok_int(&p, &v)) wfall = v;
-    if (tok_int(&p, &v)) wofft = v;
 
-    /* broken tail (no cap token): the rule behaves like a color-only one */
+    if (tok_literal(&p, "pattern") || tail_tokens(p) == 12) {
+        shared = 1;
+        if (tok_int(&p, &v)) psync = v;
+        if (tok_int(&p, &v)) prep = v;
+        for (int i = 0; i < 3 && tok_int(&p, &v); i++) pcur[i] = v;
+        if (tok_int(&p, &v)) prise = v;
+        if (tok_int(&p, &v)) phold = v;
+        if (tok_int(&p, &v)) pfall = v;
+        if (tok_int(&p, &v)) pofft = v;
+        for (int i = 0; i < 3 && tok_int(&p, &v); i++) pt0[i] = v;
+    } else {
+        if (tok_int(&p, &v)) bsync = v;
+        if (tok_int(&p, &v)) brep = v;
+        for (int i = 0; i < 3 && tok_int(&p, &v); i++) bcur[i] = v;
+        if (tok_int(&p, &v)) brise = v;
+        if (tok_int(&p, &v)) bhold = v;
+        if (tok_int(&p, &v)) bfall = v;
+        if (tok_int(&p, &v)) bofft = v;
+        if (tok_int(&p, &v)) wsync = v;
+        for (int i = 0; i < 3 && tok_int(&p, &v); i++) wt0[i] = v;
+        if (tok_int(&p, &v)) wrep = v;
+        if (tok_int(&p, &v)) wrise = v;
+        if (tok_int(&p, &v)) whold = v;
+        if (tok_int(&p, &v)) wfall = v;
+        if (tok_int(&p, &v)) wofft = v;
+    }
+
     if (cap < 0) return;
 
     char b[sizeof(g_kv[0].sec)];
@@ -320,46 +355,70 @@ static void rule_synth(const char *pkg, const char *tail)
     char triple[64];
     snprintf(b, sizeof(b), "notify.%s", pkg);
     kv_clear_sec(b);
-    snprintf(s, sizeof(s), "%s.solid", b);  kv_clear_sec(s);
-    snprintf(s, sizeof(s), "%s.breath", b); kv_clear_sec(s);
-    snprintf(s, sizeof(s), "%s.wave", b);   kv_clear_sec(s);
+    snprintf(s, sizeof(s), "%s.solid", b);    kv_clear_sec(s);
+    snprintf(s, sizeof(s), "%s.pattern", b);  kv_clear_sec(s);
+    snprintf(s, sizeof(s), "%s.breath", b);   kv_clear_sec(s);
+    snprintf(s, sizeof(s), "%s.wave", b);     kv_clear_sec(s);
 
     kvi(b, "notif_max_sec", cap);
     if (mode[0]) kv_put(b, "mode", mode);
 
-    if (scur[2] >= 0) {                     /* all three parsed */
+    if (scur[2] >= 0) {
         snprintf(s, sizeof(s), "%s.solid", b);
         snprintf(triple, sizeof(triple), "%ld,%ld,%ld", scur[0], scur[1], scur[2]);
         kv_put(s, "cur", triple);
     }
-    if (bsync >= 0 || brep >= 0 || bcur[2] >= 0 || brise >= 0 || bhold >= 0 ||
-        bfall >= 0 || bofft >= 0) {
-        snprintf(s, sizeof(s), "%s.breath", b);
-        if (bsync >= 0) kvi(s, "sync", bsync);
-        if (brep >= 0) kvi(s, "repeat", brep);
-        if (bcur[2] >= 0) {
-            kvi(s, "cur_r", bcur[0]);
-            kvi(s, "cur_g", bcur[1]);
-            kvi(s, "cur_b", bcur[2]);
+
+    if (shared) {
+        if (psync >= 0 || prep >= 0 || pcur[2] >= 0 || prise >= 0 || phold >= 0 ||
+            pfall >= 0 || pofft >= 0 || pt0[2] >= 0) {
+            snprintf(s, sizeof(s), "%s.pattern", b);
+            if (psync >= 0) kvi(s, "sync", psync);
+            if (prep >= 0) kvi(s, "repeat", prep);
+            if (pcur[2] >= 0) {
+                kvi(s, "cur_r", pcur[0]);
+                kvi(s, "cur_g", pcur[1]);
+                kvi(s, "cur_b", pcur[2]);
+            }
+            if (prise >= 0) kvi(s, "rise", prise);
+            if (phold >= 0) kvi(s, "hold", phold);
+            if (pfall >= 0) kvi(s, "fall", pfall);
+            if (pofft >= 0) kvi(s, "offt", pofft);
+            if (pt0[2] >= 0) {
+                snprintf(triple, sizeof(triple), "%ld,%ld,%ld", pt0[0], pt0[1], pt0[2]);
+                kv_put(s, "t0", triple);
+            }
         }
-        if (brise >= 0) kvi(s, "rise", brise);
-        if (bhold >= 0) kvi(s, "hold", bhold);
-        if (bfall >= 0) kvi(s, "fall", bfall);
-        if (bofft >= 0) kvi(s, "offt", bofft);
-    }
-    if (wsync >= 0 || wrep >= 0 || wt0[2] >= 0 || wrise >= 0 || whold >= 0 ||
-        wfall >= 0 || wofft >= 0) {
-        snprintf(s, sizeof(s), "%s.wave", b);
-        if (wt0[2] >= 0) {
-            snprintf(triple, sizeof(triple), "%ld,%ld,%ld", wt0[0], wt0[1], wt0[2]);
-            kv_put(s, "t0", triple);
+    } else {
+        if (bsync >= 0 || brep >= 0 || bcur[2] >= 0 || brise >= 0 || bhold >= 0 ||
+            bfall >= 0 || bofft >= 0) {
+            snprintf(s, sizeof(s), "%s.breath", b);
+            if (bsync >= 0) kvi(s, "sync", bsync);
+            if (brep >= 0) kvi(s, "repeat", brep);
+            if (bcur[2] >= 0) {
+                kvi(s, "cur_r", bcur[0]);
+                kvi(s, "cur_g", bcur[1]);
+                kvi(s, "cur_b", bcur[2]);
+            }
+            if (brise >= 0) kvi(s, "rise", brise);
+            if (bhold >= 0) kvi(s, "hold", bhold);
+            if (bfall >= 0) kvi(s, "fall", bfall);
+            if (bofft >= 0) kvi(s, "offt", bofft);
         }
-        if (wsync >= 0) kvi(s, "sync", wsync);
-        if (wrep >= 0) kvi(s, "repeat", wrep);
-        if (wrise >= 0) kvi(s, "rise", wrise);
-        if (whold >= 0) kvi(s, "hold", whold);
-        if (wfall >= 0) kvi(s, "fall", wfall);
-        if (wofft >= 0) kvi(s, "offt", wofft);
+        if (wsync >= 0 || wrep >= 0 || wt0[2] >= 0 || wrise >= 0 || whold >= 0 ||
+            wfall >= 0 || wofft >= 0) {
+            snprintf(s, sizeof(s), "%s.wave", b);
+            if (wt0[2] >= 0) {
+                snprintf(triple, sizeof(triple), "%ld,%ld,%ld", wt0[0], wt0[1], wt0[2]);
+                kv_put(s, "t0", triple);
+            }
+            if (wsync >= 0) kvi(s, "sync", wsync);
+            if (wrep >= 0) kvi(s, "repeat", wrep);
+            if (wrise >= 0) kvi(s, "rise", wrise);
+            if (whold >= 0) kvi(s, "hold", whold);
+            if (wfall >= 0) kvi(s, "fall", wfall);
+            if (wofft >= 0) kvi(s, "offt", wofft);
+        }
     }
 }
 

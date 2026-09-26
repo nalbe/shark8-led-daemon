@@ -996,64 +996,36 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
         )
     }
 
-    /** Per-event chip renderer editor (v3): the [sec] mode + the knobs of
-     *  the ACTIVE [sec.solid]/[sec.breath]/[sec.wave] section. Only the
-     *  active mode's card is shown (radio change re-syncs). */
     protected inner class RenderCard(title: String, hint: String = "", showColor: Boolean = false) : LinearLayout(context) {
         private val modeNames = listOf("off", "solid", "breath", "wave")
-
-        /** Chip timing cap: the AW2033 pattern register holds 4 bits per
-         *  time field (16 discrete codes, max 8300 ms), so GUI values
-         *  beyond this are clamped and later snapped to the nearest code. */
         private val timeMax = 8300
 
         lateinit var mode: NamePicker
             private set
         var color: RgbPicker? = null
             private set
-
-        /** Color picker whose swatch previews current * color. Set via
-         *  attachPreview() - for showColor cards it's the card's own
-         *  picker; EventKnobs attaches the standalone color card's. */
         private var previewTarget: RgbPicker? = null
-
-        /** Fired whenever the knobs that change the LIGHT (mode, cur, sync)
-         *  move - lets a rule list repaint its swatches through this
-         *  renderer (the app preset has no own color picker to preview on). */
         var onDriveChanged: (() -> Unit)? = null
 
         private lateinit var solidCard: LinearLayout
-        private lateinit var breathCard: LinearLayout
-        private lateinit var waveCard: LinearLayout
+        private lateinit var patternCard: LinearLayout
         lateinit var solidCur: TripleField
             private set
-        lateinit var brRepeat: NumField
+        lateinit var patternRepeat: NumField
             private set
-        lateinit var brCur: TripleField
+        lateinit var patternCur: TripleField
             private set
-        lateinit var brRise: NumField
+        lateinit var patternRise: NumField
             private set
-        lateinit var brHold: NumField
+        lateinit var patternHold: NumField
             private set
-        lateinit var brFall: NumField
+        lateinit var patternFall: NumField
             private set
-        lateinit var brOfft: NumField
+        lateinit var patternOfft: NumField
             private set
-        lateinit var brSync: CheckBox
+        lateinit var patternSync: CheckBox
             private set
         lateinit var waveT0: TripleField
-            private set
-        lateinit var waveRepeat: NumField
-            private set
-        lateinit var waveRise: NumField
-            private set
-        lateinit var waveHold: NumField
-            private set
-        lateinit var waveFall: NumField
-            private set
-        lateinit var waveOfft: NumField
-            private set
-        lateinit var waveSync: CheckBox
             private set
 
         init {
@@ -1074,72 +1046,48 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
                 addView(mode)
             })
             solidCard = card {
-                addView(sectionTitle("Solid param"))
+                addView(sectionTitle("Solid params"))
                 addView(spacer(4))
-                addView(text("Constant color on this event's channels, full current. Timing = none.", 12f, parse("#FF727272")))
+                addView(text("Constant color on this event's channels. Timing = none.", 12f, parse("#FF727272")))
                 addView(spacer(2))
-                solidCur = TripleField("current (amps) r,g,b (0-15)", Triple(15, 15, 15))
+                solidCur = TripleField("current r,g,b (0-15)", Triple(15, 15, 15))
                 addView(solidCur)
             }
-            breathCard = card {
-                addView(sectionTitle("Breath param"))
+            patternCard = card {
+                addView(sectionTitle("Pattern params (breath + wave)"))
                 addView(spacer(4))
-                addView(text("Chip-driven breathing. Timing is owned by [sec.breath] (no fallback). Sync moves ALL channels onto the red (master) PWM; color = per-channel cur ratio.", 12f, parse("#FF727272")))
+                addView(text("One chip preset is shared by both animated modes. t0 is used only by wave.", 12f, parse("#FF727272")))
                 addView(spacer(2))
-                brRepeat = numRow("repeat (0 = infinite, 1..15)", "0")
+                patternRepeat = numRow("repeat (0 = infinite, 1..15)", "0")
                 addView(spacer(2))
-                brSync = syncCheck("sync: all channels on master red PWM")
+                patternSync = syncCheck("sync: all channels on master red PWM")
                 addView(spacer(2))
-                brCur = TripleField("current (amps) r,g,b (0-15)", Triple(15, 15, 15))
-                addView(brCur)
-                addView(spacer(2))
-                brRise = numRow("rise (ms, max $timeMax)", "500")
-                addView(spacer(2))
-                brHold = numRow("hold (ms, max $timeMax)", "100")
-                addView(spacer(2))
-                brFall = numRow("fall (ms, max $timeMax)", "500")
-                addView(spacer(2))
-                brOfft = numRow("off time (ms, max $timeMax)", "1200")
-            }
-            waveCard = card {
-                addView(sectionTitle("Wave param"))
-                addView(spacer(4))
-                addView(text("Breathing with a per-channel t0 phase lag = traveling rainbow. Timing is owned by [sec.wave] (no fallback). Sync moves ALL channels onto the red (master) PWM; color = per-channel cur ratio.", 12f, parse("#FF727272")))
-                addView(spacer(2))
-                waveT0 = TripleField("channel phase t0 (ms)", Triple(0, 1300, 2600))
+                waveT0 = TripleField("wave phase t0 (ms)", Triple(0, 1300, 2600))
                 addView(waveT0)
                 addView(spacer(2))
-                waveRepeat = numRow("repeat (0 = infinite, 1..15)", "0")
+                patternCur = TripleField("current r,g,b (0-15)", Triple(15, 15, 15))
+                addView(patternCur)
                 addView(spacer(2))
-                waveSync = syncCheck("sync: all channels on master red PWM")
+                patternRise = numRow("rise (ms, max $timeMax)", "500")
                 addView(spacer(2))
-                waveRise = numRow("rise (ms, max $timeMax)", "500")
+                patternHold = numRow("hold (ms, max $timeMax)", "100")
                 addView(spacer(2))
-                waveHold = numRow("hold (ms, max $timeMax)", "100")
+                patternFall = numRow("fall (ms, max $timeMax)", "500")
                 addView(spacer(2))
-                waveFall = numRow("fall (ms, max $timeMax)", "500")
-                addView(spacer(2))
-                waveOfft = numRow("off time (ms, max $timeMax)", "1200")
+                patternOfft = numRow("off time (ms, max $timeMax)", "1200")
             }
             addView(solidCard)
-            addView(breathCard)
-            addView(waveCard)
+            addView(patternCard)
+            patternSync.setOnCheckedChangeListener { _, _ -> applySyncGray() }
             syncMode()
-            brSync.setOnCheckedChangeListener { _, _ -> applySyncGray() }
-            waveSync.setOnCheckedChangeListener { _, _ -> applySyncGray() }
-            applySyncGray()
             solidCur.onChanged = { refreshPreview() }
-            brCur.onChanged = { refreshPreview() }
+            patternCur.onChanged = { refreshPreview() }
             if (color != null) attachPreview(color!!)
         }
 
-        /** Sync (LCFG0.SYNC) puts G/B PWM and t0 onto the red master, so the
-         *  G/B knobs are dead on the chip while sync is on: grey them out
-         *  and steer the swatch's duty from red alone. cur stays per-channel
-         *  (it still lives under sync), so it is left editable. */
         private fun applySyncGray() {
-            val sync = (modeNames[mode.get()] == "breath" && brSync.isChecked) ||
-                (modeNames[mode.get()] == "wave" && waveSync.isChecked)
+            val m = modeNames[mode.get()]
+            val sync = (m == "breath" || m == "wave") && patternSync.isChecked
             val p = color ?: previewTarget
             if (p != null) {
                 p.pwmSync = sync
@@ -1147,20 +1095,18 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
                 p.setChannelEnabled(1, !sync)
                 p.setChannelEnabled(2, !sync)
             }
-            waveT0.setFieldEnabled(0, true)
-            waveT0.setFieldEnabled(1, !sync)
-            waveT0.setFieldEnabled(2, !sync)
+            val wave = m == "wave"
+            waveT0.setFieldEnabled(0, wave)
+            waveT0.setFieldEnabled(1, wave && !sync)
+            waveT0.setFieldEnabled(2, wave && !sync)
             onDriveChanged?.invoke()
         }
 
-        /** The current triple the active mode actually drives. solid and
-         *  breath read their knobs; wave has no per-channel current knob in
-         *  the GUI, so it previews the chip default (full). off = dark. */
         private fun activeCur(): Triple<Int, Int, Int> = when (modeNames[mode.get()]) {
             "off" -> Triple(0, 0, 0)
             "solid" -> solidCur.getTriple(Triple(15, 15, 15))
-            "breath" -> brCur.getTriple(Triple(15, 15, 15))
-            else -> Triple(15, 15, 15)
+            "breath", "wave" -> patternCur.getTriple(Triple(15, 15, 15))
+            else -> Triple(0, 0, 0)
         }
 
         fun attachPreview(p: RgbPicker) {
@@ -1174,21 +1120,16 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
             onDriveChanged?.invoke()
         }
 
-        /** The (cur, sync) the renderer's knobs currently drive - the same
-         *  light the chip would show for a given rule color, so rule-list
-         *  swatches can preview through a shared renderer. Same math as the
-         *  Status live swatch, but from the editor's live values. */
         fun liveDrive(): Pair<Triple<Int, Int, Int>, Boolean> {
-            val sync = (modeNames[mode.get()] == "breath" && brSync.isChecked) ||
-                (modeNames[mode.get()] == "wave" && waveSync.isChecked)
-            return Pair(activeCur(), sync)
+            val m = modeNames[mode.get()]
+            return Pair(activeCur(), (m == "breath" || m == "wave") && patternSync.isChecked)
         }
 
         private fun syncMode() {
             val m = modeNames[mode.get()]
             solidCard.visibility = if (m == "solid") VISIBLE else GONE
-            breathCard.visibility = if (m == "breath") VISIBLE else GONE
-            waveCard.visibility = if (m == "wave") VISIBLE else GONE
+            patternCard.visibility = if (m == "breath" || m == "wave") VISIBLE else GONE
+            waveT0.visibility = if (m == "wave") VISIBLE else GONE
             applySyncGray()
             refreshPreview()
         }
@@ -1198,20 +1139,14 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
             val fb = modeNames.indexOf(fallbackMode)
             mode.set(if (idx >= 0) idx else if (fb >= 0) fb else 2)
             solidCur.setTriple(r.solidCur)
-            brRepeat.setText(r.brRepeat.toString())
-            brCur.setTriple(r.brCur)
-            brRise.setText(r.brRise.toString())
-            brHold.setText(r.brHold.toString())
-            brFall.setText(r.brFall.toString())
-            brOfft.setText(r.brOfft.toString())
-            brSync.isChecked = r.brSync
+            patternRepeat.setText(r.patternRepeat.toString())
+            patternCur.setTriple(r.patternCur)
+            patternRise.setText(r.patternRise.toString())
+            patternHold.setText(r.patternHold.toString())
+            patternFall.setText(r.patternFall.toString())
+            patternOfft.setText(r.patternOfft.toString())
+            patternSync.isChecked = r.patternSync
             waveT0.setTriple(r.waveT0)
-            waveRepeat.setText(r.waveRepeat.toString())
-            waveRise.setText(r.waveRise.toString())
-            waveHold.setText(r.waveHold.toString())
-            waveFall.setText(r.waveFall.toString())
-            waveOfft.setText(r.waveOfft.toString())
-            waveSync.isChecked = r.waveSync
             syncMode()
         }
 
@@ -1222,20 +1157,14 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
             val m = modeNames[mode.get()]
             r.mode = m
             r.solidCur = clampTriple(solidCur.getTriple(Triple(15, 15, 15)))
-            r.brRepeat = brRepeat.getInt(0).coerceIn(0, 15)
-            r.brCur = clampTriple(brCur.getTriple(Triple(15, 15, 15)))
-            r.brRise = brRise.getInt(500).coerceIn(0, timeMax)
-            r.brHold = brHold.getInt(100).coerceIn(0, timeMax)
-            r.brFall = brFall.getInt(500).coerceIn(0, timeMax)
-            r.brOfft = brOfft.getInt(1200).coerceIn(0, timeMax)
-            r.brSync = brSync.isChecked
+            r.patternRepeat = patternRepeat.getInt(0).coerceIn(0, 15)
+            r.patternCur = clampTriple(patternCur.getTriple(Triple(15, 15, 15)))
+            r.patternRise = patternRise.getInt(500).coerceIn(0, timeMax)
+            r.patternHold = patternHold.getInt(100).coerceIn(0, timeMax)
+            r.patternFall = patternFall.getInt(500).coerceIn(0, timeMax)
+            r.patternOfft = patternOfft.getInt(1200).coerceIn(0, timeMax)
+            r.patternSync = patternSync.isChecked
             r.waveT0 = waveT0.getTriple(Triple(0, 1300, 2600))
-            r.waveRepeat = waveRepeat.getInt(0).coerceIn(0, 15)
-            r.waveRise = waveRise.getInt(500).coerceIn(0, timeMax)
-            r.waveHold = waveHold.getInt(100).coerceIn(0, timeMax)
-            r.waveFall = waveFall.getInt(500).coerceIn(0, timeMax)
-            r.waveOfft = waveOfft.getInt(1200).coerceIn(0, timeMax)
-            r.waveSync = waveSync.isChecked
         }
 
         private fun clampTriple(t: Triple<Int, Int, Int>): Triple<Int, Int, Int> =

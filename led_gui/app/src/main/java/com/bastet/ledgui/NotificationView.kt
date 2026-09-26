@@ -283,11 +283,10 @@ class NotificationView(context: Context) : ConfPage(context) {
     /** (cur, sync) a renderer drives, from that render's own config -
      *  same math as the Status live swatch. off = all dark. */
     private fun driveFor(r: Render): Pair<Triple<Int, Int, Int>, Boolean> {
-        val sync = (r.mode == "breath" && r.brSync) ||
-            (r.mode == "wave" && r.waveSync)
+        val sync = (r.mode == "breath" || r.mode == "wave") && r.patternSync
         val cur = when (r.mode) {
             "solid" -> r.solidCur
-            "breath" -> r.brCur
+            "breath", "wave" -> r.patternCur
             "off" -> Triple(0, 0, 0)
             else -> Triple(15, 15, 15)
         }

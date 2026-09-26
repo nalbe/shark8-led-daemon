@@ -7,12 +7,11 @@
  *
  *   [sec]         mode=off|solid|breath|wave
  *   [sec.solid]   cur=r,g,b         0..15 per channel current
- *   [sec.breath]  repeat=0..15, cur_r/cur_g/cur_b,
- *                 rise/hold/fall/offt (ms, owned here),
- *                 sync=0|1: LCFG0.SYNC master-channel lock (see below)
- *   [sec.wave]    t0=r,g,b phase offset (ms), repeat=0..15,
- *                 rise/hold/fall/offt (ms, owned here),
- *                 sync=0|1: LCFG0.SYNC master-channel lock (see below)
+ *   [sec.pattern] repeat=0..15, cur_r/cur_g/cur_b,
+ *                 rise/hold/fall/offt (ms), sync=0|1,
+ *                 t0=r,g,b phase offsets (wave only)
+ *
+ * Legacy [sec.breath]/[sec.wave] sections remain readable as fallbacks.
  *
  * sync (breath/wave): the AW2033's per-channel pattern controllers
  * free-run on their own T0..T4, and because the rise/fall period grows
@@ -27,9 +26,8 @@
  * the config value, cleared on solid/off), so a stale master bit can
  * never leak into a config that turned sync off.
  *
- * Timing (rise/hold/fall/offt) belongs to the chip section that
- * animates: [sec.breath] and [sec.wave] each carry their own keys.
- * No base-section timing, no fallback. The [led] section keeps only
+ * Timing (rise/hold/fall/offt) belongs to [sec.pattern], shared by breath
+ * and wave. The [led] section keeps only
  * chip/daemon globals: logging, imax.
  *
  * No timer threads, no sysfs poking, no software animation - the
@@ -91,6 +89,14 @@ static const char *led_active_mode(const char *sec)
     return mode;
 }
 
+static int led_pattern_sec(const char *sec, const char *legacy, char *out, size_t n)
+{
+    snprintf(out, n, "%s.pattern", sec);
+    if (conf_sec_exists(out)) return 1;
+    snprintf(out, n, "%s.%s", sec, legacy);
+    return conf_sec_exists(out);
+}
+
 /* read an "a,b,c" triplet from [sec] key into out[], clamped, with
  * builtin fallback (lo..hi). Returns the number of items parsed. */
 static int read_triple(const char *sec, const char *key,
@@ -127,17 +133,15 @@ static void led_solid_rgb(const char *sec, int r, int g, int b)
 }
 
 /* breathing RGB on the chip: synchronized pattern start. The timing
- * lives in the [sec.breath] chip section itself (rise/hold/fall/offt);
- * repeat/cur are knob passthrough from the same section. [sec.breath]
- * sync=1 turns on the chip's built-in master sync (LCFG0.SYNC): all
- * channels dim on PWM channel 0 (master red), per-channel cur still
- * applies. That pins the phases that otherwise drift apart because the
- * rise/fall period grows with the PWM amplitude. */
+ * lives in the shared [sec.pattern] chip section (rise/hold/fall/offt);
+ * repeat/cur are read from the same section. sync=1 turns on the chip's
+ * built-in master sync (LCFG0.SYNC): all channels dim on PWM channel 0
+ * (master red), per-channel cur still applies. */
 static void led_breathe_rgb(const char *sec, int r, int g, int b)
 {
     aw_chip *c = led_hw();
     char ss[128];
-    snprintf(ss, sizeof(ss), "%s.breath", sec);
+    led_pattern_sec(sec, "breath", ss, sizeof(ss));
     long rise = conf_get_int(ss, "rise", DEF_T_RISE);
     long hold = conf_get_int(ss, "hold", DEF_T_HOLD);
     long fall = conf_get_int(ss, "fall", DEF_T_FALL);
@@ -157,14 +161,14 @@ static void led_breathe_rgb(const char *sec, int r, int g, int b)
                cur0, cur1, cur2);
 }
 
-/* traveling-wave breathing: per-channel phase offset [sec.wave]
+/* traveling-wave breathing: per-channel phase offset [sec.pattern]
  * t0=r,g,b (ms) delays each channel start -> color glides the channel
- * sequence. The timing lives in the [sec.wave] chip section. */
+ * sequence. The shared pattern section supplies the timing. */
 static void led_wave_rgb(const char *sec, int r, int g, int b)
 {
     aw_chip *c = led_hw();
     char ss[128];
-    snprintf(ss, sizeof(ss), "%s.wave", sec);
+    led_pattern_sec(sec, "wave", ss, sizeof(ss));
     long rise = conf_get_int(ss, "rise", DEF_T_RISE);
     long hold = conf_get_int(ss, "hold", DEF_T_HOLD);
     long fall = conf_get_int(ss, "fall", DEF_T_FALL);

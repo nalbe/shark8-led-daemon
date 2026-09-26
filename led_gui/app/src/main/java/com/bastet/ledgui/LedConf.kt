@@ -3,34 +3,31 @@ package com.bastet.ledgui
 import java.util.Locale
 
 /**
- * led.conf model + text parser/renderer (v4 - per-event chip renderer).
+ * led.conf model + text parser/renderer (v5 - per-event chip renderer).
  *
  * The daemon hot-reloads the file by mtime on the next event, so a save
  * here takes effect without a restart. The file must stay ASCII-only
  * (the daemon parser and the shell toolchain are byte-oriented).
  *
- * v4 ownership: every setting lives in the section that owns it. The
- * event base section keeps only its own common keys (thresholds, cap,
- * mode, color); the chip sections own their timing:
+ * v5 ownership: every setting lives in the section that owns it. The
+ * event base section keeps its own common keys (thresholds, cap, mode,
+ * color); the chip sections own their renderer parameters:
  *   [sec]           mode=off|solid|breath|wave (+ event common keys)
  *   [sec.solid]     cur=r,g,b          0..15 per-channel current
- *   [sec.breath]    repeat, cur_r/cur_g/cur_b, rise/hold/fall/offt,
- *                   sync=0|1 (LCFG0.SYNC master-channel lock)
- *   [sec.wave]      t0=r,g,b phase offsets (ms), repeat, rise/hold/fall/offt,
- *                   sync=0|1 (LCFG0.SYNC master-channel lock)
- * There is NO fallback anywhere: a chip section carries its own timing,
- * nothing is inherited from the base section.
+ *   [sec.pattern]   sync, repeat, cur_r/cur_g/cur_b, rise/hold/fall/offt,
+ *                   t0=r,g,b phase offsets (ms)
+ * One pattern preset is shared by breath and wave. t0 is used only by wave;
+ * all other pattern keys are used by both modes.
  * [led] carries only daemon/chip globals: logging, imax.
  *
  * [rules] entries may carry their OWN full notify preset inline instead
  * of the shared one:
- *   pkg = r,g,b , notif_max_sec , mode ,
- *         solid_cur_r,g,b ,
- *         breath sync,repeat,cur_r,g,b,rise,hold,fall,offt ,
- *         wave   sync,t0_r,g,b,repeat,rise,hold,fall,offt
+ *   pkg = r,g,b , notif_max_sec , mode , solid_cur_r,g,b ,
+ *         pattern , sync , repeat , cur_r,g,b , rise,hold,fall,offt ,
+ *         t0_r,g,b
  * (positional, left-prefix: a broken token stops the tail, the rest fall
  * back to defaults - same rules as the daemon parser). The daemon
- * synthesize such lines into a [notify.<pkg>] preset section at load;
+ * synthesizes such lines into a [notify.<pkg>] preset section at load;
  * color-only lines are legacy and keep resolving to [notify.app].
  * The pending window (notify_screen_delay_ms) is NOT per-app: it stays a
  * single shared [notify] value.
@@ -57,37 +54,29 @@ class Rule(
         this(pkg, r, g, b, 0, Render(), false)
 }
 
-/** Per-event chip renderer (v4): how ONE event (or charge band)
- *  animates the AW2033. Every chip section owns its own timing; there
- *  is no base-section timing and no fallback. */
+/** Per-event chip renderer (v5): how ONE event (or charge band)
+ *  animates the AW2033. Breath and wave share one pattern preset; t0 is
+ *  the only wave-specific part. */
 data class Render(
     var mode: String = "breath",
     var solidCur: Triple<Int, Int, Int> = Triple(15, 15, 15),
-    var brRepeat: Int = 0,
-    var brCur: Triple<Int, Int, Int> = Triple(15, 15, 15),
-    var brRise: Int = 500,
-    var brHold: Int = 100,
-    var brFall: Int = 500,
-    var brOfft: Int = 1200,
-    var brSync: Boolean = false,
-    var waveT0: Triple<Int, Int, Int> = Triple(0, 1300, 2600),
-    var waveRepeat: Int = 0,
-    var waveRise: Int = 500,
-    var waveHold: Int = 100,
-    var waveFall: Int = 500,
-    var waveOfft: Int = 1200,
-    var waveSync: Boolean = false
+    var patternRepeat: Int = 0,
+    var patternCur: Triple<Int, Int, Int> = Triple(15, 15, 15),
+    var patternRise: Int = 500,
+    var patternHold: Int = 100,
+    var patternFall: Int = 500,
+    var patternOfft: Int = 1200,
+    var patternSync: Boolean = false,
+    var waveT0: Triple<Int, Int, Int> = Triple(0, 1300, 2600)
 )
 
 /** charge bands breathe at 700/100/700/900, calls at 800/200/800/400 */
 private fun Render.chargeTiming() = apply {
-    brRise = 700; brHold = 100; brFall = 700; brOfft = 900
-    waveRise = 700; waveHold = 100; waveFall = 700; waveOfft = 900
+    patternRise = 700; patternHold = 100; patternFall = 700; patternOfft = 900
 }
 
 private fun Render.callTiming() = apply {
-    brRise = 800; brHold = 200; brFall = 800; brOfft = 400
-    waveRise = 800; waveHold = 200; waveFall = 800; waveOfft = 400
+    patternRise = 800; patternHold = 200; patternFall = 800; patternOfft = 400
 }
 
 data class LedConf(
@@ -173,6 +162,26 @@ data class LedConf(
 
     private fun parseMode(v: String): String? = if (v.trim() in VALID_MODES) v.trim() else null
 
+    private fun parsePatternKey(r: Render, k: String, v: String) {
+        when (k) {
+            "repeat" -> v.toIntOrNull()?.let { r.patternRepeat = it.coerceIn(0, 15) }
+            "cur_r" -> v.toIntOrNull()?.let {
+                r.patternCur = Triple(it.coerceIn(0, 15), r.patternCur.second, r.patternCur.third)
+            }
+            "cur_g" -> v.toIntOrNull()?.let {
+                r.patternCur = Triple(r.patternCur.first, it.coerceIn(0, 15), r.patternCur.third)
+            }
+            "cur_b" -> v.toIntOrNull()?.let {
+                r.patternCur = Triple(r.patternCur.first, r.patternCur.second, it.coerceIn(0, 15))
+            }
+            "rise" -> v.toIntOrNull()?.let { r.patternRise = it }
+            "hold" -> v.toIntOrNull()?.let { r.patternHold = it }
+            "fall" -> v.toIntOrNull()?.let { r.patternFall = it }
+            "offt" -> v.toIntOrNull()?.let { r.patternOfft = it }
+            "sync" -> v.toIntOrNull()?.let { r.patternSync = it != 0 }
+        }
+    }
+
     private fun parseRenderSection(r: Render, kind: String, k: String, v: String) {
         when (kind) {
             "solid" -> if (k == "cur") parseTriple(v)?.let {
@@ -180,27 +189,36 @@ data class LedConf(
                     it.first.coerceIn(0, 15), it.second.coerceIn(0, 15), it.third.coerceIn(0, 15)
                 )
             }
-            "breath" -> when (k) {
-                "repeat" -> v.toIntOrNull()?.let { r.brRepeat = it.coerceIn(0, 15) }
-                "cur_r" -> v.toIntOrNull()?.let { r.brCur = Triple(it.coerceIn(0, 15), r.brCur.second, r.brCur.third) }
-                "cur_g" -> v.toIntOrNull()?.let { r.brCur = Triple(r.brCur.first, it.coerceIn(0, 15), r.brCur.third) }
-                "cur_b" -> v.toIntOrNull()?.let { r.brCur = Triple(r.brCur.first, r.brCur.second, it.coerceIn(0, 15)) }
-                "rise" -> v.toIntOrNull()?.let { r.brRise = it }
-                "hold" -> v.toIntOrNull()?.let { r.brHold = it }
-                "fall" -> v.toIntOrNull()?.let { r.brFall = it }
-                "offt" -> v.toIntOrNull()?.let { r.brOfft = it }
-                "sync" -> v.toIntOrNull()?.let { r.brSync = it != 0 }
+            "pattern" -> {
+                if (k == "t0") {
+                    parseTriple(v)?.let {
+                        r.waveT0 = Triple(
+                            it.first.coerceAtLeast(0), it.second.coerceAtLeast(0),
+                            it.third.coerceAtLeast(0)
+                        )
+                    }
+                } else parsePatternKey(r, k, v)
             }
-            "wave" -> when (k) {
-                "t0" -> parseTriple(v)?.let { r.waveT0 = Triple(
-                    it.first.coerceAtLeast(0), it.second.coerceAtLeast(0), it.third.coerceAtLeast(0)
-                ) }
-                "repeat" -> v.toIntOrNull()?.let { r.waveRepeat = it.coerceIn(0, 15) }
-                "rise" -> v.toIntOrNull()?.let { r.waveRise = it }
-                "hold" -> v.toIntOrNull()?.let { r.waveHold = it }
-                "fall" -> v.toIntOrNull()?.let { r.waveFall = it }
-                "offt" -> v.toIntOrNull()?.let { r.waveOfft = it }
-                "sync" -> v.toIntOrNull()?.let { r.waveSync = it != 0 }
+            "breath" -> parsePatternKey(r, k, v)
+            "wave" -> {
+                if (r.mode == "wave" && k != "cur") r.patternCur = Triple(15, 15, 15)
+                if (k == "t0") {
+                    parseTriple(v)?.let {
+                        r.waveT0 = Triple(
+                            it.first.coerceAtLeast(0), it.second.coerceAtLeast(0),
+                            it.third.coerceAtLeast(0)
+                        )
+                    }
+                } else if (k == "cur") {
+                    parseTriple(v)?.let {
+                        r.patternCur = Triple(
+                            it.first.coerceIn(0, 15), it.second.coerceIn(0, 15),
+                            it.third.coerceIn(0, 15)
+                        )
+                    }
+                } else if (r.mode == "wave") {
+                    parsePatternKey(r, k, v)
+                }
             }
         }
     }
@@ -379,11 +397,10 @@ data class LedConf(
         LedSim.cal = LedSim.Cal(pvwR / 100.0, pvwG / 100.0, pvwB / 100.0, pvwGamma)
     }
 
-/** Parse one [rules] value ("r,g,b[,cap[,mode[,...]]]").
- *  The tail is positional and left-prefix exactly like the daemon's:
- *  the first malformed token stops the stream and its slot plus
- *  everything after it keep their defaults. A rule whose cap (first
- *  tail token) is missing or broken stays legacy (custom=false). */
+    /** Parse one [rules] value ("r,g,b[,cap[,mode[,...]]]").
+     *  The tail is positional and left-prefix exactly like the daemon's.
+     *  New custom lines carry one named pattern block; the old two-block
+     *  breath/wave tail is still accepted and is collapsed on the next save. */
     private fun parseRuleValue(pkg: String, value: String): Rule? {
         val t = value.split(',')
         if (t.size < 3) return null
@@ -409,6 +426,14 @@ data class LedConf(
             assign(Triple(a.toInt().coerceIn(0, 15), b.toInt().coerceIn(0, 15),
                           c.toInt().coerceIn(0, 15)))
         }
+        fun phaseSlot(assign: (Triple<Int, Int, Int>) -> Unit) {
+            if (stopped) return
+            val a = next() ?: run { stopped = true; return@phaseSlot }
+            val b = next() ?: run { stopped = true; return@phaseSlot }
+            val c = next() ?: run { stopped = true; return@phaseSlot }
+            assign(Triple(a.toInt().coerceAtLeast(0), b.toInt().coerceAtLeast(0),
+                          c.toInt().coerceAtLeast(0)))
+        }
 
         slot { cap = it }
         if (!stopped) {
@@ -418,22 +443,53 @@ data class LedConf(
             }
         }
         tripleSlot { render.solidCur = it }
-        slot { render.brSync = it != 0L }
-        slot { render.brRepeat = it.toInt().coerceIn(0, 15) }
-        tripleSlot { render.brCur = it }
-        slot { render.brRise = it.toInt() }
-        slot { render.brHold = it.toInt() }
-        slot { render.brFall = it.toInt() }
-        slot { render.brOfft = it.toInt() }
-        slot { render.waveSync = it != 0L }
-        tripleSlot { render.waveT0 = Triple(
-            it.first.coerceAtLeast(0), it.second.coerceAtLeast(0), it.third.coerceAtLeast(0)
-        ) }
-        slot { render.waveRepeat = it.toInt().coerceIn(0, 15) }
-        slot { render.waveRise = it.toInt() }
-        slot { render.waveHold = it.toInt() }
-        slot { render.waveFall = it.toInt() }
-        slot { render.waveOfft = it.toInt() }
+
+        val markedPattern = !stopped && i < t.size && t[i].trim() == "pattern"
+        if (markedPattern) i++
+        val newTail = markedPattern || (!stopped && t.size - i == 12)
+        if (newTail) {
+            slot { render.patternSync = it != 0L }
+            slot { render.patternRepeat = it.toInt().coerceIn(0, 15) }
+            tripleSlot { render.patternCur = it }
+            slot { render.patternRise = it.toInt() }
+            slot { render.patternHold = it.toInt() }
+            slot { render.patternFall = it.toInt() }
+            slot { render.patternOfft = it.toInt() }
+            phaseSlot { render.waveT0 = it }
+        } else if (!stopped) {
+            slot { render.patternSync = it != 0L }
+            slot { render.patternRepeat = it.toInt().coerceIn(0, 15) }
+            tripleSlot { render.patternCur = it }
+            slot { render.patternRise = it.toInt() }
+            slot { render.patternHold = it.toInt() }
+            slot { render.patternFall = it.toInt() }
+            slot { render.patternOfft = it.toInt() }
+
+            var waveSync: Long? = null
+            var waveRepeat: Int? = null
+            var waveRise: Int? = null
+            var waveHold: Int? = null
+            var waveFall: Int? = null
+            var waveOfft: Int? = null
+            var wavePhase: Triple<Int, Int, Int>? = null
+            slot { waveSync = it }
+            phaseSlot { wavePhase = it }
+            slot { waveRepeat = it.toInt().coerceIn(0, 15) }
+            slot { waveRise = it.toInt() }
+            slot { waveHold = it.toInt() }
+            slot { waveFall = it.toInt() }
+            slot { waveOfft = it.toInt() }
+            wavePhase?.let { render.waveT0 = it }
+            if (render.mode == "wave") {
+                render.patternCur = Triple(15, 15, 15)
+                waveSync?.let { render.patternSync = it != 0L }
+                waveRepeat?.let { render.patternRepeat = it }
+                waveRise?.let { render.patternRise = it }
+                waveHold?.let { render.patternHold = it }
+                waveFall?.let { render.patternFall = it }
+                waveOfft?.let { render.patternOfft = it }
+            }
+        }
 
         val custom = cap >= 0
         return Rule(
@@ -454,31 +510,28 @@ data class LedConf(
             sb.append(',').append(rule.maxSec)
             sb.append(',').append(r.mode)
             sb.append(',').append(tripleClamp(r.solidCur, 0, 15))
-            sb.append(',').append(if (r.brSync) 1 else 0)
-            sb.append(',').append(r.brRepeat.coerceIn(0, 15))
-            sb.append(',').append(tripleClamp(r.brCur, 0, 15))
-            sb.append(',').append(r.brRise).append(',').append(r.brHold)
-                .append(',').append(r.brFall).append(',').append(r.brOfft)
-            sb.append(',').append(if (r.waveSync) 1 else 0).append(',')
-                .append(r.waveT0.first.coerceAtLeast(0)).append(',')
+            sb.append(",pattern,")
+            sb.append(if (r.patternSync) 1 else 0)
+            sb.append(',').append(r.patternRepeat.coerceIn(0, 15))
+            sb.append(',').append(tripleClamp(r.patternCur, 0, 15))
+            sb.append(',').append(r.patternRise).append(',').append(r.patternHold)
+                .append(',').append(r.patternFall).append(',').append(r.patternOfft)
+            sb.append(',').append(r.waveT0.first.coerceAtLeast(0)).append(',')
                 .append(r.waveT0.second.coerceAtLeast(0)).append(',')
                 .append(r.waveT0.third.coerceAtLeast(0))
-            sb.append(',').append(r.waveRepeat.coerceIn(0, 15))
-            sb.append(',').append(r.waveRise).append(',').append(r.waveHold)
-                .append(',').append(r.waveFall).append(',').append(r.waveOfft)
         }
         return sb.toString()
     }
 
     fun render(): String {
         val sb = StringBuilder()
-        sb.append("# led_hal_root runtime config - generated by LED GUI (v4)\n")
+        sb.append("# led_hal_root runtime config - generated by LED GUI (v5)\n")
         sb.append("# ASCII only. Save applies on the next daemon event (mtime reload).\n")
         sb.append("#\n")
         sb.append("# [suppress] one package per line - never lights the LED\n")
         sb.append("# [rules]    pkg=r,g,b  (0-255 per channel)\n")
         sb.append("#            + optional own preset tail: cap, mode,\n")
-        sb.append("#            solid_cur, breath, wave (see header for layout)\n")
+        sb.append("#            solid_cur, pattern, t0 (see header for layout)\n")
         sb.append("# [charge]   thresholds ONLY; each band owns color/timing\n")
         sb.append("# [notify]   shared behavior: notif_max_sec, default color\n")
         sb.append("# [ring]     incoming call rainbow: max_sec, base color\n")
@@ -487,10 +540,9 @@ data class LedConf(
         sb.append("# [missed]   missed-call indication: color, max_sec\n")
         sb.append("# [alarm]    alarm clock indication: color, max_sec\n")
         sb.append("#\n")
-        sb.append("# v4 renderer: every event owns [sec] mode and the\n")
-        sb.append("# [sec.solid]/[sec.breath]/[sec.wave] chip sections. Each chip\n")
-        sb.append("# section owns its own rise/hold/fall/offt - no base-section\n")
-        sb.append("# timing, no fallback.\n")
+        sb.append("# v5 renderer: every event owns [sec] mode plus one shared\n")
+        sb.append("# [sec.pattern] preset for breath and wave. t0 applies only\n")
+        sb.append("# to wave; solid current stays in [sec.solid].\n")
         sb.append("\n[suppress]\n")
         for (p in suppress) sb.append(p).append('\n')
         sb.append("\n[rules]\n")
@@ -560,26 +612,19 @@ data class LedConf(
     private fun appendRenderChips(sb: StringBuilder, sec: String, r: Render) {
         sb.append("\n[").append(sec).append(".solid]\n")
         sb.append("cur=").append(tripleClamp(r.solidCur, 0, 15)).append('\n')
-        sb.append("\n[").append(sec).append(".breath]\n")
-        sb.append("sync=").append(if (r.brSync) 1 else 0).append('\n')
-        sb.append("repeat=").append(r.brRepeat.coerceIn(0, 15)).append('\n')
-        sb.append("cur_r=").append(r.brCur.first.coerceIn(0, 15)).append('\n')
-        sb.append("cur_g=").append(r.brCur.second.coerceIn(0, 15)).append('\n')
-        sb.append("cur_b=").append(r.brCur.third.coerceIn(0, 15)).append('\n')
-        sb.append("rise=").append(r.brRise).append('\n')
-        sb.append("hold=").append(r.brHold).append('\n')
-        sb.append("fall=").append(r.brFall).append('\n')
-        sb.append("offt=").append(r.brOfft).append('\n')
-        sb.append("\n[").append(sec).append(".wave]\n")
-        sb.append("sync=").append(if (r.waveSync) 1 else 0).append('\n')
+        sb.append("\n[").append(sec).append(".pattern]\n")
+        sb.append("sync=").append(if (r.patternSync) 1 else 0).append('\n')
+        sb.append("repeat=").append(r.patternRepeat.coerceIn(0, 15)).append('\n')
+        sb.append("cur_r=").append(r.patternCur.first.coerceIn(0, 15)).append('\n')
+        sb.append("cur_g=").append(r.patternCur.second.coerceIn(0, 15)).append('\n')
+        sb.append("cur_b=").append(r.patternCur.third.coerceIn(0, 15)).append('\n')
+        sb.append("rise=").append(r.patternRise).append('\n')
+        sb.append("hold=").append(r.patternHold).append('\n')
+        sb.append("fall=").append(r.patternFall).append('\n')
+        sb.append("offt=").append(r.patternOfft).append('\n')
         sb.append("t0=").append(r.waveT0.first.coerceAtLeast(0)).append(',')
             .append(r.waveT0.second.coerceAtLeast(0)).append(',')
             .append(r.waveT0.third.coerceAtLeast(0)).append('\n')
-        sb.append("repeat=").append(r.waveRepeat.coerceIn(0, 15)).append('\n')
-        sb.append("rise=").append(r.waveRise).append('\n')
-        sb.append("hold=").append(r.waveHold).append('\n')
-        sb.append("fall=").append(r.waveFall).append('\n')
-        sb.append("offt=").append(r.waveOfft).append('\n')
     }
 
     fun save(): Su.Result = Su.writeFile(CONF_PATH, render())

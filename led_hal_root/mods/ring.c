@@ -99,8 +99,8 @@ void arm_ring_ex(int incoming, int test)
     g_ring_test = test;
     snprintf(g_st.cur_pkg, sizeof(g_st.cur_pkg), "%s", INCOMING_PKG);
     g_st.armed_at = time(NULL);
-    /* [ring] renderer: mode from [ring]/chip sections, color from the
-     * section itself, timing from the [ring.breath]/[ring.wave] chips */
+    /* [ring] renderer: mode from [ring], color from the section, timing
+     * from the shared [ring.pattern] chip section */
     int r, g, b;
     ring_rgb(&r, &g, &b);
     const char *engine = led_event("ring", r, g, b);

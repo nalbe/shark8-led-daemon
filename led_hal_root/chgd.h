@@ -73,10 +73,10 @@ void nls_status_write(int connected);
 /* ---------------- LED hardware (led.c, the only writer) ---------------- */
 
 /* per-event renderer: paints [sec] using its own mode + [sec.solid]/
- * [sec.breath]/[sec.wave] chip sections and returns the mode string
+ * [sec.pattern] chip sections and returns the mode string
  * ("off"|"solid"|"breath"|"wave") for the status engine field.
- * Each chip section owns its own timing keys (rise/hold/fall/offt);
- * the event only supplies the colors. No base-section timing. */
+ * Breath and wave share the pattern preset; t0 applies only to wave.
+ * The event only supplies the colors. No base-section timing. */
 const char *led_event(const char *sec, int r, int g, int b);
 void led_init_hw(void);
 void leds_all_off(void);
