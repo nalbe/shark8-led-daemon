@@ -9,6 +9,72 @@ out of here:
 - the AW2033 chip controller and `awctl` live in the **aw2033-driver** repo
   (this repo ships only the prebuilt `libaw2033.a`)
 
+## Revision: a broken preset is logged and skipped, never guessed (2026-09-28, v3.7.1)
+
+Every animated renderer substituted a builtin for anything the config
+did not supply: `DEF_T_*` timings, `cur=15,15,15`, `sync=0`,
+`t0=0,1300,2600`, and `mode` defaulted to `breath`. That is how a v3.6
+daemon reading a v1.3-GUI v5 `led.conf` produced a "broken" LED with an
+empty log - the daemon reported `cur=15,15,15 sync=0` while the config
+asked for `cur=15,1,11 sync=1`, and the AW2033's three pattern
+controllers free-ran out of phase (channels at different PWM amplitudes
+drift), so purple breathed with green flashing through it. The fallbacks
+are gone; a preset that cannot be read is now reported and the event is
+skipped.
+
+1. **New `LOGW` channel** (`chgd.h`, `util.c`): warnings carry a `warn: `
+   prefix and deliberately ignore the `[led] logging` switch - the point
+   is that a skipped event stays visible with routine logging off.
+   `log_line()`/`log_warn()` share one `log_emit()` writer, so the 64KB
+   rotation applies to both.
+2. **`config.c` reports every unreadable `[rules]` tail** instead of
+   returning silently. A tail whose first token is not a number and a
+   tail that breaks mid-stream are both named (`preset tail broken at
+   token "xx,..."`), counted in `g_nbroken`, and repeated once in the
+   `conf: loaded` summary. `MAX_RULES` / `MAX_KV` / `MAX_SUPP` overflow
+   no longer drops entries unnoticed either.
+3. **`led.c` requires its keys.** `req_int()` / `req_triple()` report the
+   offending key and fail; `led_breathe_rgb()` and `led_wave_rgb()` skip
+   the event on a missing `[sec.pattern]`, a missing
+   `rise/hold/fall/offt/repeat/cur_r/cur_g/cur_b/sync` (plus `t0` for
+   wave) or a missing `[sec.solid] cur`. `led_active_mode()` returns
+   NULL (skip) instead of assuming `breath`, and an unknown mode word
+   no longer falls through to breath. `read_triple()` survives only for
+   the genuinely optional wave `cur=` override.
+4. **`conf_notify_sec()` returns the shared `[notify]` preset**, not
+   `notify.app` - a section the v5 schema never writes, so a color-only
+   rule resolved to a section that did not exist and every key defaulted.
+5. **`mods/charge.c` does not fingerprint a skipped event** (`engine ==
+   NULL`), so a repaint actually happens once the config is fixed instead
+   of the stale LED state being treated as current.
+6. **`build_module.cmd` writes zip entries with `/`.**
+   `ZipFile::CreateFromDirectory` on .NET Framework emits the Windows
+   separator, so the archive carried `mods\alarm.c` and
+   `META-INF\com\google\android\update-binary` as single flat names; on
+   device `ksud` reported `chown: ... No such file or directory` and the
+   module applied only halfway (`module.prop` updated, `chgd` left at the
+   previous build). That is the likely reason a v3.7.0 install never
+   reached the daemon. The archive is now built entry by entry with
+   normalized names.
+7. **GUI 1.4 (code 5) matches the new daemon.** It still read the pre-v5
+   `[notify.app]` section and used it to preview color-only rules; nothing
+   resolves to that section any more, so the Info live swatch drew a
+   preset the chip never received and the per-app rows inherited values
+   that were dead on arrival. `[notify.app]` is now simply ignored on
+   load, the `notifyAppRender` / `notifAppMaxSec` fields are gone, and a
+   color-only rule previews the shared `[notify]` preset - which is what
+   the daemon applies. The old promotion pass (seed color-only rules from
+   `[notify.app]` and force them to full tails) is removed: a color-only
+   rule now stays color-only until the user customizes it, which is the
+   honest representation. The GUI parser stays lenient about a truncated
+   tail so a damaged file still opens, and its header comment now states
+   the divergence instead of claiming "same rules as the daemon" - a tail
+   the GUI shows as partial is one the daemon refuses to paint.
+8. v3.7.1 / versionCode 32; `chgd` and `led_gui-release.apk` rebuilt.
+   Verified on device: the Telegram rule now reaches the chip as
+   `cur=15,1,11 sync=1`; a tail with a non-numeric token logs the token, a
+   preset with `t0` deleted logs `missing key t0`, and neither paints.
+
 ## Revision: one shared [sec.pattern] chip preset for breath and wave (2026-09-26, v3.7.0)
 
 `breath` and `wave` each owned a full chip section with the same keys

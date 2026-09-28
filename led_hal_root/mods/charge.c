@@ -281,7 +281,12 @@ static void apply_band(const char *band_in)
         return;
 
     const char *engine = led_event(sec, r, g, b);
-    snprintf(g_applied_band, sizeof(g_applied_band), "%s", fp);
+    /* A skipped event (engine == NULL: broken preset) must NOT be
+     * fingerprinted as applied, or the next refresh would treat the
+     * stale LED state as current and never repaint after the config is
+     * fixed. Leave the fingerprint empty so the next refresh retries. */
+    if (engine)
+        snprintf(g_applied_band, sizeof(g_applied_band), "%s", fp);
     status_write("charge", band, "", r, g, b, engine);
 }
 

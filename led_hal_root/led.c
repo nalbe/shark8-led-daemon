@@ -43,17 +43,66 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include "chgd.h"
 #include "../lib/aw2033.h"
 
-/* builtin timing for a chip section that omits its keys (the GUI always
- * writes them; this only covers hand-written minimal configs) */
-#define DEF_T_RISE 500
-#define DEF_T_HOLD 100
-#define DEF_T_FALL 500
-#define DEF_T_OFFT 1200
+/* clamp helper for the config knobs the sections let through */
+static int clampi(long v, int lo, int hi)
+{
+    if (v < lo) v = lo;
+    if (v > hi) v = hi;
+    return (int)v;
+}
+
+/* ---------------- strict preset readers ----------------
+ *
+ * No builtin timing/current/phase substitutes here. A chip section that
+ * omits a key is a broken preset: painting it with a default produces
+ * exactly the "LED blinks wrong and nothing is logged" class of bug.
+ * Every reader below reports the offending key and fails, and the
+ * caller skips the event instead of guessing. */
+
+/* required integer key: absent or non-numeric -> warn + fail */
+static int req_int(const char *sec, const char *key, long *out)
+{
+    const char *v = conf_get_str(sec, key);
+    if (!v || !v[0]) {
+        LOGW("[led] %s: missing key %s", sec, key);
+        return 0;
+    }
+    char *end = NULL;
+    long x = strtol(v, &end, 10);
+    if (end == v || *end) {
+        LOGW("[led] %s: key %s=\"%s\" is not a number", sec, key, v);
+        return 0;
+    }
+    *out = x;
+    return 1;
+}
+
+/* required "a,b,c" key, clamped to lo..hi; absent or malformed -> warn
+ * + fail. Reports every missing key in one line instead of one per key. */
+static int req_triple(const char *sec, const char *key,
+                      int *out, int lo, int hi)
+{
+    const char *v = conf_get_str(sec, key);
+    if (!v || !v[0]) {
+        LOGW("[led] %s: missing key %s", sec, key);
+        return 0;
+    }
+    int a, b, c;
+    if (sscanf(v, "%d,%d,%d", &a, &b, &c) != 3) {
+        LOGW("[led] %s: key %s=\"%s\" is not \"a,b,c\"", sec, key, v);
+        return 0;
+    }
+    out[0] = clampi(a, lo, hi);
+    out[1] = clampi(b, lo, hi);
+    out[2] = clampi(c, lo, hi);
+    return 1;
+}
 
 /* ---------------- AW2033 core handle ---------------- */
 
@@ -71,38 +120,40 @@ static aw_chip *led_hw(void)
     return g_aw;
 }
 
-/* clamp helpers for the config knobs the sections let through */
-static int clampi(long v, int lo, int hi)
-{
-    if (v < lo) v = lo;
-    if (v > hi) v = hi;
-    return (int)v;
-}
-
-/* active [sec] renderer mode: explicit led.conf key, "breath" when the
- * section has none (the GUI always writes mode=, so this is only for
- * hand-written minimal configs). */
+/* active [sec] renderer mode: explicit led.conf key only. A section
+ * without mode= is a broken config, so it is reported and reported as
+ * NULL - the caller skips the event instead of painting a breath nobody
+ * asked for. */
 static const char *led_active_mode(const char *sec)
 {
     const char *mode = conf_get_str(sec, "mode");
-    if (!mode || !mode[0]) return "breath";
+    if (!mode || !mode[0]) {
+        LOGW("[led] %s: missing key mode", sec);
+        return NULL;
+    }
     return mode;
 }
 
+/* the chip preset section to render from: [sec.pattern], or the legacy
+ * [sec.breath]/[sec.wave] while old configs are still around. */
 static int led_pattern_sec(const char *sec, const char *legacy, char *out, size_t n)
 {
     snprintf(out, n, "%s.pattern", sec);
     if (conf_sec_exists(out)) return 1;
     snprintf(out, n, "%s.%s", sec, legacy);
-    return conf_sec_exists(out);
+    if (conf_sec_exists(out)) return 1;
+    LOGW("[led] %s: no [%s.pattern] and no legacy [%s.%s], event skipped",
+         sec, sec, sec, legacy);
+    return 0;
 }
 
-/* read an "a,b,c" triplet from [sec] key into out[], clamped, with
- * builtin fallback (lo..hi). Returns the number of items parsed. */
+/* optional "a,b,c" reader: 0 when the key is absent or malformed, and
+ * the caller keeps its own value. Only for genuinely optional extras
+ * (the wave cur= override a hand-written config may add) - never as a
+ * substitute for a key the preset requires. */
 static int read_triple(const char *sec, const char *key,
-                       int *out, int d0, int d1, int d2, int lo, int hi)
+                       int *out, int lo, int hi)
 {
-    out[0] = d0; out[1] = d1; out[2] = d2;
     const char *s = conf_get_str(sec, key);
     if (!s) return 0;
     int a, b, c;
@@ -121,7 +172,7 @@ static void led_solid_rgb(const char *sec, int r, int g, int b)
     char ss[128];
     int cur[3];
     snprintf(ss, sizeof(ss), "%s.solid", sec);
-    read_triple(ss, "cur", cur, 15, 15, 15, 0, 15);
+    if (!req_triple(ss, "cur", cur, 0, 15)) return;
     LOGI("[led] %s solid rgb=%d,%d,%d cur=%d,%d,%d", sec, r, g, b,
          cur[0], cur[1], cur[2]);
     if (!c) return;
@@ -141,24 +192,30 @@ static void led_breathe_rgb(const char *sec, int r, int g, int b)
 {
     aw_chip *c = led_hw();
     char ss[128];
-    led_pattern_sec(sec, "breath", ss, sizeof(ss));
-    long rise = conf_get_int(ss, "rise", DEF_T_RISE);
-    long hold = conf_get_int(ss, "hold", DEF_T_HOLD);
-    long fall = conf_get_int(ss, "fall", DEF_T_FALL);
-    long offt = conf_get_int(ss, "offt", DEF_T_OFFT);
-    int  repeat  = clampi(conf_get_int(ss, "repeat", 0), 0, 15);
-    int  cur0    = clampi(conf_get_int(ss, "cur_r", 15), 0, 15);
-    int  cur1    = clampi(conf_get_int(ss, "cur_g", 15), 0, 15);
-    int  cur2    = clampi(conf_get_int(ss, "cur_b", 15), 0, 15);
-    int  sync    = clampi(conf_get_int(ss, "sync", 0), 0, 1);
-    LOGI("[led] %s breathe rgb=%d,%d,%d t=%ld,%ld,%ld,%ldms cur=%d,%d,%d rep=%d sync=%d",
+    long rise, hold, fall, offt, repeat, cur0, cur1, cur2, sync;
+    if (!led_pattern_sec(sec, "breath", ss, sizeof(ss))) return;
+    if (!req_int(ss, "rise",  &rise))  return;
+    if (!req_int(ss, "hold",  &hold))  return;
+    if (!req_int(ss, "fall",  &fall))  return;
+    if (!req_int(ss, "offt",  &offt))  return;
+    if (!req_int(ss, "repeat", &repeat)) return;
+    if (!req_int(ss, "cur_r", &cur0)) return;
+    if (!req_int(ss, "cur_g", &cur1)) return;
+    if (!req_int(ss, "cur_b", &cur2)) return;
+    if (!req_int(ss, "sync",  &sync))  return;
+    cur0 = clampi(cur0, 0, 15);
+    cur1 = clampi(cur1, 0, 15);
+    cur2 = clampi(cur2, 0, 15);
+    repeat = clampi(repeat, 0, 15);
+    sync = clampi(sync, 0, 1);
+    LOGI("[led] %s breathe rgb=%d,%d,%d t=%ld,%ld,%ld,%ldms cur=%ld,%ld,%ld rep=%ld sync=%ld",
          sec, r, g, b, rise, hold, fall, offt, cur0, cur1, cur2, repeat, sync);
     if (!c) return;
     /* LCFG0.SYNC must be in place before the pattern arms (the chip
      * latches the master-channel mode at pattern start). */
-    aw_sync_mode(c, sync);
-    aw_breathe(c, r, g, b, rise, hold, fall, offt, 0, repeat, 1,
-               cur0, cur1, cur2);
+    aw_sync_mode(c, (int)sync);
+    aw_breathe(c, r, g, b, rise, hold, fall, offt, 0, (int)repeat, 1,
+               (int)cur0, (int)cur1, (int)cur2);
 }
 
 /* traveling-wave breathing: per-channel phase offset [sec.pattern]
@@ -168,41 +225,42 @@ static void led_wave_rgb(const char *sec, int r, int g, int b)
 {
     aw_chip *c = led_hw();
     char ss[128];
-    led_pattern_sec(sec, "wave", ss, sizeof(ss));
-    long rise = conf_get_int(ss, "rise", DEF_T_RISE);
-    long hold = conf_get_int(ss, "hold", DEF_T_HOLD);
-    long fall = conf_get_int(ss, "fall", DEF_T_FALL);
-    long offt = conf_get_int(ss, "offt", DEF_T_OFFT);
+    long rise, hold, fall, offt, repeat, cur0, cur1, cur2, sync;
+    if (!led_pattern_sec(sec, "wave", ss, sizeof(ss))) return;
+    if (!req_int(ss, "rise",  &rise))  return;
+    if (!req_int(ss, "hold",  &hold))  return;
+    if (!req_int(ss, "fall",  &fall))  return;
+    if (!req_int(ss, "offt",  &offt))  return;
+    if (!req_int(ss, "repeat", &repeat)) return;
+    if (!req_int(ss, "cur_r", &cur0)) return;
+    if (!req_int(ss, "cur_g", &cur1)) return;
+    if (!req_int(ss, "cur_b", &cur2)) return;
+    if (!req_int(ss, "sync",  &sync))  return;
+    int zi[3];
+    if (!req_triple(ss, "t0", zi, 0, 65535)) return;
+    long z[3] = { zi[0], zi[1], zi[2] };
     long rt[3] = { rise, rise, rise };
     long ht[3] = { hold, hold, hold };
     long ft[3] = { fall, fall, fall };
     long ot[3] = { offt, offt, offt };
-    long z[3] = {0, 1300, 2600};
-    const char *st0 = conf_get_str(ss, "t0");
-    if (st0) {
-        long a, b, c;
-        if (sscanf(st0, "%ld,%ld,%ld", &a, &b, &c) == 3) {
-            if (a < 0) a = 0; if (b < 0) b = 0; if (c < 0) c = 0;
-            z[0] = a; z[1] = b; z[2] = c;
-        }
-    }
-    int repeat = clampi(conf_get_int(ss, "repeat", 0), 0, 15);
-    int cur0 = clampi(conf_get_int(ss, "cur_r", 15), 0, 15);
-    int cur1 = clampi(conf_get_int(ss, "cur_g", 15), 0, 15);
-    int cur2 = clampi(conf_get_int(ss, "cur_b", 15), 0, 15);
-    int sync  = clampi(conf_get_int(ss, "sync", 0), 0, 1);
+    cur0 = clampi(cur0, 0, 15);
+    cur1 = clampi(cur1, 0, 15);
+    cur2 = clampi(cur2, 0, 15);
+    repeat = clampi(repeat, 0, 15);
+    sync = clampi(sync, 0, 1);
     /* allow a plain cur=r,g,b triple too (GUI writes none for wave, but
      * hand-written configs may use the same key as solid) */
-    int curc[3] = { cur0, cur1, cur2 };
-    if (read_triple(ss, "cur", curc, cur0, cur1, cur2, 0, 15))
-        { cur0 = curc[0]; cur1 = curc[1]; cur2 = curc[2]; }
-    LOGI("[led] %s wave rgb=%d,%d,%d t=%ld/%ld/%ld/%ld t0=%ld,%ld,%ld rep=%d cur=%d,%d,%d sync=%d",
+    int curc[3] = { (int)cur0, (int)cur1, (int)cur2 };
+    if (read_triple(ss, "cur", curc, 0, 15)) {
+        cur0 = curc[0]; cur1 = curc[1]; cur2 = curc[2];
+    }
+    LOGI("[led] %s wave rgb=%d,%d,%d t=%ld/%ld/%ld/%ld t0=%d,%d,%d rep=%ld cur=%ld,%ld,%ld sync=%ld",
          sec, r, g, b, rt[0], ht[0], ft[0], ot[0], z[0], z[1], z[2], repeat,
          cur0, cur1, cur2, sync);
     if (!c) return;
-    int cur[3] = { cur0, cur1, cur2 };
-    aw_sync_mode(c, sync);
-    aw_breathe_ex(c, r, g, b, rt, ht, ft, ot, z, repeat, 1, cur);
+    int cur[3] = { (int)cur0, (int)cur1, (int)cur2 };
+    aw_sync_mode(c, (int)sync);
+    aw_breathe_ex(c, r, g, b, rt, ht, ft, ot, z, (int)repeat, 1, cur);
 }
 
 void leds_all_off(void)
@@ -217,11 +275,13 @@ void leds_all_off(void)
 
 /* per-event dispatch used by charge/notify/missed/alarm/ring/voip.
  * Resolves the active mode for [sec], paints, and returns the mode
- * string for the status file's engine field. Timing comes from the
+ * string for the status file's engine field (NULL when the event was
+ * skipped, which every caller already tolerates). Timing comes from the
  * chip sections themselves; the event only supplies sec + colors. */
 const char *led_event(const char *sec, int r, int g, int b)
 {
     const char *mode = led_active_mode(sec);
+    if (!mode) return NULL;      /* no mode= -> warned, event skipped */
 
     if (!strcmp(mode, "off"))
         leds_all_off();
@@ -229,8 +289,13 @@ const char *led_event(const char *sec, int r, int g, int b)
         led_solid_rgb(sec, r, g, b);
     else if (!strcmp(mode, "wave"))
         led_wave_rgb(sec, r, g, b);
-    else
+    else if (!strcmp(mode, "breath"))
         led_breathe_rgb(sec, r, g, b);
+    else {
+        /* an unknown mode word used to fall through to breath */
+        LOGW("[led] %s: unknown mode \"%s\", event skipped", sec, mode);
+        return NULL;
+    }
     return mode;
 }
 

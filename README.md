@@ -47,7 +47,7 @@ only), `install_core.cmd` (build + deploy to device), `install_gui.cmd`
 
 ## Install
 
-1. Download [`led_hal_root-v3.7.0.zip`](https://github.com/nalbe/shark8-led-daemon/releases/latest) (flashable KernelSU module)
+1. Download [`led_hal_root-v3.7.1.zip`](https://github.com/nalbe/shark8-led-daemon/releases/latest) (flashable KernelSU module)
 2. Flash in KernelSU Manager -> Modules -> Install from storage
 3. `customize.sh` installs both apps automatically (`pm install -r`,
    non-fatal on failure):
@@ -80,6 +80,13 @@ and the wave-only `t0=r,g,b` phase offsets (the staggering that produces
 the traveling rainbow). The daemon also accepts the legacy
 `[section.breath]`/`[section.wave]` sections for migration.
 
+Every key listed above is **required** - there are no built-in timings,
+currents or `sync` defaults left to fall through on. A preset that
+cannot be read completely (missing section or key, non-numeric value,
+unknown `mode`) logs a `warn:` line naming the offending key and the
+event is skipped, leaving the previous LED state alone. Warnings ignore
+the `[led] logging` switch, so they survive with routine logging off.
+
 Events:
 
 - **charge** - three bands (lower/middle/upper), each with its own
@@ -92,8 +99,10 @@ Events:
   optional plugged bit gates the band: `plugged=0` (broadcast says no
   source is attached) forces "none".
 - **notification** - `[notify]` is the shared preset for apps without a
-  rule; a `[rules]` entry with a custom tail gets its own synthesized preset,
-  while color-only entries retain the legacy `[notify.app]` fallback
+  rule; a `[rules]` entry with a custom tail gets its own synthesized
+  preset. Color-only entries also resolve to `[notify]` - the legacy
+  `[notify.app]` section is still read by the GUI (for old files) but the
+  daemon no longer points at it, because the v5 schema never writes it
 - **ring** - SIM/dialer calls, incoming and outgoing
 - **voip** - messenger calls (any app the bridge classifies as a call
   notification - category CALL / call channel)
@@ -216,10 +225,13 @@ Views app with a follow-the-finger swipe pager and six tabs:
 - **Charge** - thresholds (`[charge]` first/second) + one renderer card
   per band (LOW/MID/HIGH): mode, color, per-channel current,
   breathing/wave timing
-- **Notification** - the two presets, each fully editable: **default**
-  (`[notify]`, apps without a rule) and **app** (`[notify.app]`,
-  rule-matched apps share this renderer; per-app colors live in the
-  `pkg=r,g,b` `[rules]` list + suppressed packages, one per line)
+- **Notification** - two views: **default** (`[notify]`, the shared preset
+  for apps WITHOUT a rule: cap, renderer, pending window) and **app** (the
+  per-app `[rules]` list - each rule owns its color and, once customized,
+  its own cap and renderer; swatches preview through that rule's own
+  `cur` + `sync`). A color-only rule shows the default preset, which is
+  what the daemon applies. The pre-v5 `[notify.app]` section of old files
+  is ignored on load and dropped on the next save
 - **Call** - two views: **in-call** (`[ring]` renderer, max cap,
   color/timing) and **missed** (`[missed]` LED, max cap, color/timing)
 - **VoIP** - `[voip]` renderer and safety cap. Which apps count as a
@@ -233,6 +245,7 @@ on the next daemon event, no restart, no rebuild. Requires root
 `led_gui-release.apk`.
 
 ### Screenshots
+> **Note:** These screenshots are conceptual and may not represent the final product.
 
 <details>
 <summary>Show LED GUI screenshots</summary>
@@ -345,8 +358,9 @@ mods/
               plugged=0 forces the band off
   queue.c   - notification priority pool: LIFO pick, screen-on Q_HOLD staging,
               preemption with resume-credit, lazy grace/expiry, cap accrue
-  notify.c  - notification gate (suppress -> per-app color -> [notify]/
-              [notify.app] renderer), owns the armed channel + pool heartbeat
+  notify.c  - notification gate (suppress -> per-app color -> [notify]
+              renderer or the rule's own synthesized preset), owns the
+              armed channel + pool heartbeat
   ring.c    - SIM call mode (RING_ON/RING_OFF), [ring] renderer. The tombstone
               comes from the bridge as MISSED_ON and missed.c owns it
   missed.c  - missed-call LED, driven purely by the bridge's

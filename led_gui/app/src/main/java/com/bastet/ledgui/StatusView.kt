@@ -195,7 +195,7 @@ private fun render() {
             "notify" -> when {
                 c.rules.any { it.pkg == led.pkg } ->
                     c.rules.first { it.pkg == led.pkg }.takeIf { it.custom }
-                        ?.render ?: c.notifyAppRender
+                        ?.render ?: c.notifyRender
                 else -> c.notifyRender
             }
             "ring" -> c.ringRender

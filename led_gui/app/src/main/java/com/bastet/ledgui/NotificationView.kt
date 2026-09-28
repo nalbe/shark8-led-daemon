@@ -31,9 +31,10 @@ import android.widget.TextView
  *  rule's OWN renderer (cur + sync), like the Status live swatch.
  *
  *  Legacy: pre-v5 files used a shared [notify.app] preset for color-only
- *  rules. LedConf seeds those rules from it once and promotes them to
- *  full lines (custom=true), so nothing is lost on save - the GUI no
- *  longer writes [notify.app]. */
+ * rules. Nothing reads that section any more (the daemon resolves
+ * color-only rules to [notify] since v3.7.1), so it is ignored on load
+ * and dropped on save; a color-only rule simply shows the default
+ * preset, which is what the daemon will apply. */
 class NotificationView(context: Context) : ConfPage(context) {
 
     /** App sub-page rule blocks:
@@ -85,7 +86,7 @@ class NotificationView(context: Context) : ConfPage(context) {
 
         appGroup = LinearLayout(context).apply { orientation = VERTICAL }
         val rulesCard = card {
-            addView(titleRow("Per-app rules (apps WITH a rule)") {
+            addView(titleRow("Per-app rules") {
                 pickApp("Add rule (flashing app)", rulePkgs()) { pkg, _ -> addRule(pkg) }
             })
             addView(spacer(4))

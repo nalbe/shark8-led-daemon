@@ -31,19 +31,15 @@ void log_set_enabled(int on)
     g_log_allow = on ? 1 : 0;
 }
 
-void log_line(const char *fmt, ...)
+/* shared tail of log_line()/log_warn(): timestamp + append + size cap.
+ * force = 1 writes even when the [led] logging switch is off. */
+static void log_emit(const char *msg, int force)
 {
-    char msg[512];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(msg, sizeof(msg), fmt, ap);
-    va_end(ap);
-
     if (g_verbose) {
         fprintf(stderr, "%s\n", msg);
         return;
     }
-    if (!g_log_allow) return;
+    if (!g_log_allow && !force) return;
     FILE *n = fopen("/data/local/tmp/ledd.log", "a");
     if (!n) return;
     long sz = ftell(n);
@@ -71,6 +67,30 @@ void log_line(const char *fmt, ...)
     strftime(tbuf, sizeof(tbuf), "%m-%d %H:%M:%S", &tm_);
     fprintf(n, "%s %s\n", tbuf, msg);
     fclose(n);
+}
+
+void log_line(const char *fmt, ...)
+{
+    char msg[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    log_emit(msg, 0);
+}
+
+/* prefix every warning with "warn:" so a single grep separates real
+ * config problems from the routine event trace. Bypasses g_log_allow. */
+void log_warn(const char *fmt, ...)
+{
+    char msg[512];
+    char out[544];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    snprintf(out, sizeof(out), "warn: %s", msg);
+    log_emit(out, 1);
 }
 
 /* ---------------- file read / atomic write helpers ---------------- */

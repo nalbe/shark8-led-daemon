@@ -53,7 +53,24 @@ if errorlevel 1 exit /b 1
 echo [3/3] Packaging release\led_hal_root-v%VER%.zip...
 if not exist "%ROOT%release" mkdir "%ROOT%release"
 if exist "%ROOT%release\led_hal_root-v%VER%.zip" del /q "%ROOT%release\led_hal_root-v%VER%.zip"
-powershell -NoProfile -Command "Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::CreateFromDirectory('%STAGE%','%ROOT%release\led_hal_root-v%VER%.zip',[System.IO.Compression.CompressionLevel]::Optimal,$false)"
+rem ZipFile::CreateFromDirectory on .NET Framework writes the WINDOWS
+rem separator into every entry name, so "mods\alarm.c" and
+rem "META-INF\com\google\android\update-binary" land on the device as
+rem single files whose names contain a literal backslash. A module
+rem installed that way silently loses parts of itself (ksud reports
+rem chown: ... No such file or directory and the daemon never gets
+rem replaced). Build the archive by hand with '/' in every entry name -
+rem the zip format requires '/', a backslash is not a path separator.
+powershell -NoProfile -Command ^
+  "Add-Type -AssemblyName System.IO.Compression;" ^
+  "Add-Type -AssemblyName System.IO.Compression.FileSystem;" ^
+  "$stage='%STAGE%'; $zip='%ROOT%release\led_hal_root-v%VER%.zip';" ^
+  "$fs=[IO.File]::Open($zip,'Create');" ^
+  "$ar=New-Object IO.Compression.ZipArchive($fs,[IO.Compression.ZipArchiveMode]::Create);" ^
+  "Get-ChildItem -LiteralPath $stage -Recurse -File | ForEach-Object {" ^
+  "  $rel=$_.FullName.Substring($stage.Length).TrimStart('\','/').Replace('\','/');" ^
+  "  [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($ar,$_.FullName,$rel,[IO.Compression.CompressionLevel]::Optimal) | Out-Null }; " ^
+  "$ar.Dispose(); $fs.Dispose()"
 if errorlevel 1 (
     echo ZIP FAILED
     rmdir /s /q "%STAGE%" 2>nul

@@ -51,6 +51,13 @@ void log_line(const char *fmt, ...);
 #define LOGI(...) log_line(__VA_ARGS__)
 /* runtime logging switch: driven by [led] logging in led.conf */
 void log_set_enabled(int on);
+/* Warning channel: a broken preset, an unparsed [rules] tail, a config
+ * table overflow - anything where the daemon used to silently substitute
+ * a builtin and change what the LEDs do. Deliberately IGNORES the
+ * [led] logging switch: the whole point is that a silently skipped
+ * event must stay visible even when routine logging is off. */
+void log_warn(const char *fmt, ...);
+#define LOGW(...) log_warn(__VA_ARGS__)
 
 /* ---------------- sysfs / device helpers ---------------- */
 
@@ -135,7 +142,8 @@ const char *conf_get_str(const char *sec, const char *key); /* NULL = absent */
 long conf_get_int(const char *sec, const char *key, long def);
 /* preset section a notification for [pkg] must use: the synthetic
  * [notify.<pkg>] when that rule carries an extended tail, else the
- * legacy shared [notify.app] (color-only rules). Callers pick "notify"
+ * shared [notify] (color-only rules). The legacy [notify.app] is not a
+ * valid target - the v5 schema never writes it. Callers pick "notify"
  * themselves for packages without a rule. */
 const char *conf_notify_sec(const char *pkg);
 /* does a [section] exist at all? (e.g. a synthetic per-rule preset) */

@@ -12,7 +12,7 @@
  *               tail carries that app's OWN notify preset (cap, pending
  *               window, renderer mode, chip knobs) and is synthesized into
  *               a [notify.<pkg>] section at load. Without the tail the app
- *               behaves exactly as before (shared [notify.app] preset).
+ *               uses the shared [notify] preset.
  *   [charge]    first_threshold / second_threshold (%) ONLY - each band
  *               owns its renderer: [charge.lower|middle|upper] mode=
  *               color= plus the [charge.<band>.solid/pattern] chip
@@ -20,9 +20,10 @@
  *   [notify]    behavior for apps WITHOUT a [rules] entry:
  *               notif_max_sec (0 = unlimited), default_color r,g,b,
  *               notify_screen_delay_ms + renderer mode/chip sections
- *   [notify.app]  legacy shared preset for [rules] entries that carry only
- *               the color triple (no extended tail) - kept for backwards
- *               compatibility, not written by the template anymore
+ *   [notify.app]  legacy shared preset from pre-v5 files (color-only
+ *               rules). Still parsed so old files load, but nothing
+ *               resolves to it since v3.7.1: a color-only rule now uses
+ *               [notify], the section the v5 template actually writes.
  *   [ring]      incoming-call rainbow: max_sec + v3 color
  *   [voip]      messenger-call rainbow: max_sec + v3 color
  *
@@ -108,6 +109,11 @@ static time_t g_last_mtime = 0;
  * flip it live (write led.conf, SIGALRM). Defaults to on. */
 static int g_logging = 1;
 
+/* [rules] tails that could not be turned into a full preset. Counted
+ * (not just logged) so the "conf: loaded" summary can report a non-zero
+ * number the moment a GUI/daemon version mismatch is in play. */
+static int g_nbroken = 0;
+
 /* ---------------- helpers ---------------- */
 
 static void trim(char *s)
@@ -181,6 +187,7 @@ static void reset_dynamic(void)
     g_nsupp = 0;
     g_nrules = 0;
     g_nkv = 0;
+    g_nbroken = 0;
     seed_rules();
     g_first_at = DEF_FIRST_AT;
     g_second_at = DEF_SECOND_AT;
@@ -200,7 +207,10 @@ static void kv_put(const char *sec, const char *key, const char *val)
             return;
         }
     }
-    if (g_nkv >= MAX_KV) return;
+    if (g_nkv >= MAX_KV) {
+        LOGW("[conf] kv table full (%d), dropped [%s] %s", MAX_KV, sec, key);
+        return;
+    }
     snprintf(g_kv[g_nkv].sec, sizeof(g_kv[g_nkv].sec), "%s", sec);
     snprintf(g_kv[g_nkv].key, sizeof(g_kv[g_nkv].key), "%s", key);
     snprintf(g_kv[g_nkv].val, sizeof(g_kv[g_nkv].val), "%s", val);
@@ -348,7 +358,24 @@ static void rule_synth(const char *pkg, const char *tail)
         if (tok_int(&p, &v)) wofft = v;
     }
 
-    if (cap < 0) return;
+    if (cap < 0) {
+        /* No cap token at all: the tail starts with something that is not
+         * an int. Nothing gets synthesized, the rule degrades to
+         * colour-only. Say so - this is the shape a version mismatch
+         * between the GUI and the daemon produces. */
+        LOGW("[conf] rule %s: preset tail starts with a non-number, "
+             "colour-only kept: %s", pkg, tail);
+        g_nbroken++;
+        return;
+    }
+    if (p) {
+        /* The cursor stopped mid-tail: the first unparsable token ends
+         * the stream and everything after it was dropped. Report what is
+         * left so the bad token is visible instead of guessed. */
+        LOGW("[conf] rule %s: preset tail broken at token \"%s\", "
+             "the rest was ignored", pkg, p);
+        g_nbroken++;
+    }
 
     char b[sizeof(g_kv[0].sec)];
     char s[sizeof(g_kv[0].sec)];
@@ -495,6 +522,8 @@ static void parse_value(const char *sec, const char *key, const char *val)
             g_rules[g_nrules].g = g;
             g_rules[g_nrules].b = b;
             g_nrules++;
+        } else if (!present) {
+            LOGW("[conf] rules table full (%d), dropped rule %s", MAX_RULES, key);
         }
         /* color-only lines keep the shared legacy preset; extended lines
          * synthesize a per-package section (a broken tail falls back to
@@ -526,6 +555,8 @@ static void load_file(void)
         if (!strcmp(sec, "suppress")) {
             if (!in_supp(line) && g_nsupp < MAX_SUPP)
                 snprintf(g_supp[g_nsupp++], sizeof(g_supp[0]), "%s", line);
+            else if (!in_supp(line))
+                LOGW("[conf] suppress list full (%d), dropped %s", MAX_SUPP, line);
             continue;
         }
         char *eq = strchr(line, '=');
@@ -557,6 +588,9 @@ static void load_file(void)
     log_set_enabled(g_logging);
     LOGI("conf: loaded %s (%d suppressed, %d rules) logging=%d",
          CONF_PATH, g_nsupp, g_nrules, g_logging);
+    if (g_nbroken)
+        LOGW("[conf] %d rule(s) had an unreadable preset tail - "
+             "they run colour-only until led.conf is rewritten", g_nbroken);
 }
 
 /* ---------------- public early hooks (called from core) ---------------- */
@@ -724,8 +758,8 @@ int conf_sec_exists(const char *sec)
 
 /* preset section a notification for [pkg] must read:
  *   extended rule -> synthetic "notify.<pkg>" (its own preset),
- *   color-only rule -> legacy shared "notify.app",
- *   (callers pass their own "notify" for packages without a rule).
+ *   otherwise the shared "notify" default preset (a colour-only rule
+ *   carries no timing of its own, so it inherits the shared one).
  * The returned pointer is stable until the next reload. */
 const char *conf_notify_sec(const char *pkg)
 {
@@ -734,5 +768,5 @@ const char *conf_notify_sec(const char *pkg)
         snprintf(conf_sec_buf, sizeof(conf_sec_buf), "notify.%s", pkg);
         if (kv_has_sec(conf_sec_buf)) return conf_sec_buf;
     }
-    return "notify.app";
+    return "notify";
 }

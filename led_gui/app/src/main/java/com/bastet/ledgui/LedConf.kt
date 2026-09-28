@@ -25,10 +25,13 @@ import java.util.Locale
  *   pkg = r,g,b , notif_max_sec , mode , solid_cur_r,g,b ,
  *         pattern , sync , repeat , cur_r,g,b , rise,hold,fall,offt ,
  *         t0_r,g,b
- * (positional, left-prefix: a broken token stops the tail, the rest fall
- * back to defaults - same rules as the daemon parser). The daemon
+ * (positional, left-prefix: a broken token stops the tail and the rest is
+ * dropped. The GUI stays lenient here so a damaged file still opens, but
+ * note the daemon no longer is - since v3.7.1 it logs the offending token
+ * and SKIPS the event instead of substituting defaults. A tail the GUI
+ * shows as partial is one the daemon will refuse to paint.) The daemon
  * synthesizes such lines into a [notify.<pkg>] preset section at load;
- * color-only lines are legacy and keep resolving to [notify.app].
+ * color-only lines are legacy and resolve to the shared [notify] preset.
  * The pending window (notify_screen_delay_ms) is NOT per-app: it stays a
  * single shared [notify] value.
  */
@@ -36,9 +39,9 @@ import java.util.Locale
  * One [rules] entry. Color is always own; everything else is own ONCE the
  * line carries the extended tail (custom=true, the GUI always writes full
  * lines for such rules). Legacy color-only lines (custom=false) keep
- * serializing as "pkg=r,g,b" and resolve to the legacy [notify.app]
- * preset on the daemon; the parser seeds them from it once so nothing is
- * lost when the file is next saved (the GUI no longer writes [notify.app]).
+ * serializing as "pkg=r,g,b" and resolve to the shared [notify] preset on
+ * the daemon - the pre-v5 [notify.app] section is read by nobody now, so
+ * it is simply ignored on load and dropped on the next save.
  */
 class Rule(
     val pkg: String,
@@ -90,7 +93,6 @@ data class LedConf(
     var notifMaxSec: Long = 0,
     var notifyScreenDelayMs: Long = 60000,
     var notifyColor: Triple<Int, Int, Int> = Triple(255, 150, 150),
-    var notifAppMaxSec: Long = 0,
     var ringCapSec: Long = 0,
     var ringColor: Triple<Int, Int, Int> = Triple(255, 255, 255),
     var voipMaxSec: Long = 300,
@@ -101,7 +103,6 @@ data class LedConf(
     var chargeMiddle: Render = Render().chargeTiming(),
     var chargeUpper: Render = Render().chargeTiming(),
     var notifyRender: Render = Render(),
-    var notifyAppRender: Render = Render(),
     var missedRender: Render = Render(),
     var alarmRender: Render = Render(),
     var ringRender: Render = Render(mode = "wave").callTiming(),
@@ -149,7 +150,6 @@ data class LedConf(
 
     private fun renderBySec(sec: String): Render? = when (sec) {
         "notify" -> notifyRender
-        "notify.app" -> notifyAppRender
         "charge.lower" -> chargeLower
         "charge.middle" -> chargeMiddle
         "charge.upper" -> chargeUpper
@@ -225,7 +225,6 @@ data class LedConf(
 
     fun parse(text: String) {
         var section = ""
-        var sawNotifyApp = false
         for (rawLine in text.lineSequence()) {
             val line = rawLine.trim()
             if (line.isEmpty() || line.startsWith("#") || line.startsWith(";")) continue
@@ -270,17 +269,6 @@ data class LedConf(
                             else if (section == "charge.middle") middleColor = it
                             else upperColor = it
                         }
-                    }
-                }
-                "notify.app" -> {
-                    sawNotifyApp = true
-                    val i = line.indexOf('=')
-                    if (i <= 0) continue
-                    val k = line.substring(0, i).trim()
-                    val v = line.substring(i + 1).trim()
-                    when (k) {
-                        "notif_max_sec" -> v.toLongOrNull()?.let { notifAppMaxSec = it }
-                        "mode" -> parseMode(v)?.let { notifyAppRender.mode = it }
                     }
                 }
                 "notify" -> {
@@ -375,19 +363,6 @@ data class LedConf(
                             )
                         }
                     }
-                }
-            }
-        }
-        /* Legacy migration: color-only rules (custom=false) used to resolve
-         * on the daemon to the shared [notify.app] preset; the GUI no longer
-         * WRITES that section, so those rules are seeded once from it and
-         * promoted to full lines - nothing is lost on the next save. */
-        if (sawNotifyApp) {
-            for (rule in rules) {
-                if (!rule.custom) {
-                    rule.maxSec = notifAppMaxSec
-                    rule.render = notifyAppRender.copy()
-                    rule.custom = true
                 }
             }
         }
