@@ -2,53 +2,71 @@ package com.bastet.ledgui
 
 import java.util.Locale
 
-/**
- * led.conf model + text parser/renderer (v5 - per-event chip renderer).
+/* File overview - led.conf model + text parser/renderer (v6).
  *
  * The daemon hot-reloads the file by mtime on the next event, so a save
  * here takes effect without a restart. The file must stay ASCII-only
  * (the daemon parser and the shell toolchain are byte-oriented).
  *
- * v5 ownership: every setting lives in the section that owns it. The
- * event base section keeps its own common keys (thresholds, cap, mode,
- * color); the chip sections own their renderer parameters:
- *   [sec]           mode=off|solid|breath|wave (+ event common keys)
- *   [sec.solid]     cur=r,g,b          0..15 per-channel current
- *   [sec.pattern]   sync, repeat, cur_r/cur_g/cur_b, rise/hold/fall/offt,
- *                   t0=r,g,b phase offsets (ms)
- * One pattern preset is shared by breath and wave. t0 is used only by wave;
- * all other pattern keys are used by both modes.
- * [led] carries only daemon/chip globals: logging, imax.
+ * A SAVE IS A PATCH, not a rewrite: the module ships led.conf with its
+ * comments as the documentation of the format, and the GUI edits values
+ * into the file it finds on the device (ConfWriter). Comments, blank
+ * lines, the section order and every key this model has no vocabulary
+ * for therefore survive a save untouched, a key the file is missing is
+ * added, and only the two list sections ([suppress], [rules]) are kept in
+ * step with the model line for line, because there the list IS the value.
  *
- * [rules] entries may carry their OWN full notify preset inline instead
- * of the shared one:
- *   pkg = r,g,b , notif_max_sec , mode , solid_cur_r,g,b ,
- *         pattern , sync , repeat , cur_r,g,b , rise,hold,fall,offt ,
- *         t0_r,g,b
- * (positional, left-prefix: a broken token stops the tail and the rest is
- * dropped. The GUI stays lenient here so a damaged file still opens, but
- * note the daemon no longer is - since v3.7.1 it logs the offending token
- * and SKIPS the event instead of substituting defaults. A tail the GUI
- * shows as partial is one the daemon will refuse to paint.) The daemon
- * synthesizes such lines into a [notify.<pkg>] preset section at load;
- * color-only lines are legacy and resolve to the shared [notify] preset.
- * The pending window (notify_screen_delay_ms) is NOT per-app: it stays a
+ * v6 ownership: every setting lives in the section that owns it, and one
+ * render= line carries that section's whole renderer:
+ *   render=<r,g,b>,<mode>,<cur_r,g,b>,pattern,<sync>,<repeat>,
+ *          <cur_r,g,b>,<rise>,<hold>,<fall>,<offt>,<t0_r,g,b>
+ * The colour at the head of that line is the section's own colour and the
+ * only place one is written (for [notify] it is the colour apps without a
+ * [rules] entry paint in). mode is off|solid|breath|wave, then the solid
+ * current, the literal "pattern" marker and the preset shared by breath
+ * and wave: sync, repeat, pattern current, timing and the wave phase
+ * offsets t0. t0 is used only by wave; all other preset fields are used
+ * by both modes. The event base section keeps its own common keys
+ * (thresholds, cap); [led] carries only daemon/chip globals: logging,
+ * imax.
+ *
+ * [rules] entries carry that app's own cap and preset, which is exactly
+ * the render line without its leading colour:
+ *   pkg = r,g,b , max_sec , <the 17 render fields after the colour>
+ * All 17 must be there, like in the render line: the GUI reads a short
+ * tail as colour-only (what the daemon does with it) and says so, so a
+ * damaged file never silently grows a preset on the next save. A
+ * colour-only line resolves to the shared [notify] preset.
+ * The basin window (notify_screen_delay_ms) is NOT per-app: it stays a
  * single shared [notify] value.
+ *
+ * [priority] carries the pool ranking (bigger wins, one key per kind).
+ * The daemon compares nothing hardcoded, so these values ARE the
+ * arbitration; the defaults below mirror RANK_* in led_hal_root/chgd.h.
+ * All six kinds are ordinary entries of one pool, the charge band included
+ * (it just has the lowest default rank); no test button owns a key.
+ *
+ * The Priority tab edits the section as an ORDERED LIST, never as typed
+ * numbers: the ranks are derived from the row order (top row wins, step
+ * 10) and on load the rows are sorted by the numbers the file really has.
+ * An unknown key or a non-numeric value is IGNORED and collected into
+ * [warnings]: a save leaves that line alone (it patches values into the
+ * file), but the GUI cannot show it and must not pretend it read it. The
+ * daemon is stricter: the same broken key DROPS the effect (channel.c),
+ * so the GUI keeps the last good number instead of writing one the daemon
+ * would reject.
  */
 /**
- * One [rules] entry. Color is always own; everything else is own ONCE the
- * line carries the extended tail (custom=true, the GUI always writes full
- * lines for such rules). Legacy color-only lines (custom=false) keep
- * serializing as "pkg=r,g,b" and resolve to the shared [notify] preset on
- * the daemon - the pre-v5 [notify.app] section is read by nobody now, so
- * it is simply ignored on load and dropped on the next save.
- */
+ * One [rules] entry. The colour is always own; cap and the preset are own
+ * once the line carries them (custom=true, and such a line is always
+ * written back whole). A colour-only line (custom=false) resolves to the
+ * shared [notify] preset. */
 class Rule(
     val pkg: String,
     var r: Int,
     var g: Int,
     var b: Int,
-    /** own cap (notif_max_sec, 0 = unlimited) - written only when custom */
+    /** own cap (max_sec, 0 = unlimited) - written only when custom */
     var maxSec: Long = 0,
     var render: Render = Render(),
     var custom: Boolean = false
@@ -57,9 +75,9 @@ class Rule(
         this(pkg, r, g, b, 0, Render(), false)
 }
 
-/** Per-event chip renderer (v5): how ONE event (or charge band)
- *  animates the AW2033. Breath and wave share one pattern preset; t0 is
- *  the only wave-specific part. */
+/** Per-event chip renderer: how ONE event (or charge band)
+ *  animates the AW2033. Breath and wave share one preset; the phase
+ *  offsets waveT0 are the only wave-specific part. */
 data class Render(
     var mode: String = "breath",
     var solidCur: Triple<Int, Int, Int> = Triple(15, 15, 15),
@@ -73,7 +91,13 @@ data class Render(
     var waveT0: Triple<Int, Int, Int> = Triple(0, 1300, 2600)
 )
 
-/** charge bands breathe at 700/100/700/900, calls at 800/200/800/400 */
+/** Defaults mirror module/led.conf, the canonical template that is always
+ *  overwritten on install. They are the starting point for a NEW config:
+ *  the daemon drops any key the file does not carry, so the GUI and the
+ *  template must agree on every one of these or the first save would
+ *  quietly change a light.
+ *
+ *  Charge bands breathe at 700/100/700/900, calls at 800/200/800/400. */
 private fun Render.chargeTiming() = apply {
     patternRise = 700; patternHold = 100; patternFall = 700; patternOfft = 900
 }
@@ -85,31 +109,60 @@ private fun Render.callTiming() = apply {
 data class LedConf(
     val suppress: MutableList<String> = mutableListOf(),
     val rules: MutableList<Rule> = mutableListOf(),
-    var firstThreshold: Int = 90,
+    /** [priority] channel ranking: effect -> rank, bigger wins. Mirrors
+     *  RANK_* in the daemon; a missing key keeps the default, equal ranks
+     *  fall back to that same default order, and a key we do not know is
+     *  reported in [warnings] instead of being taken over. */
+    val priority: MutableMap<String, Int> = mutableMapOf(),
+    var firstThreshold: Int = 70,
     var secondThreshold: Int = 95,
-    var lowerColor: Triple<Int, Int, Int> = Triple(255, 32, 32),
-    var middleColor: Triple<Int, Int, Int> = Triple(255, 127, 32),
-    var upperColor: Triple<Int, Int, Int> = Triple(64, 255, 32),
+    var lowerColor: Triple<Int, Int, Int> = Triple(128, 8, 8),
+    var middleColor: Triple<Int, Int, Int> = Triple(145, 56, 0),
+    var upperColor: Triple<Int, Int, Int> = Triple(64, 128, 32),
     var notifMaxSec: Long = 0,
     var notifyScreenDelayMs: Long = 60000,
-    var notifyColor: Triple<Int, Int, Int> = Triple(255, 150, 150),
-    var ringCapSec: Long = 0,
+    var notifyColor: Triple<Int, Int, Int> = Triple(255, 255, 255),
+    var ringCapSec: Long = 300,
     var ringColor: Triple<Int, Int, Int> = Triple(255, 255, 255),
     var voipMaxSec: Long = 300,
     var voipColor: Triple<Int, Int, Int> = Triple(255, 255, 255),
     var logging: Boolean = true,
     var imax: Int = 30,
-    var chargeLower: Render = Render().chargeTiming(),
-    var chargeMiddle: Render = Render().chargeTiming(),
-    var chargeUpper: Render = Render().chargeTiming(),
-    var notifyRender: Render = Render(),
-    var missedRender: Render = Render(),
-    var alarmRender: Render = Render(),
-    var ringRender: Render = Render(mode = "wave").callTiming(),
-    var voipRender: Render = Render(mode = "wave").callTiming(),
+    var chargeLower: Render = Render(
+        mode = "solid", patternSync = true,
+        patternCur = Triple(4, 0, 0)
+    ).chargeTiming(),
+    var chargeMiddle: Render = Render(
+        mode = "solid", patternSync = true,
+        patternCur = Triple(5, 1, 0)
+    ).chargeTiming(),
+    var chargeUpper: Render = Render(
+        mode = "solid", patternSync = false,
+        patternCur = Triple(15, 15, 15)
+    ).chargeTiming(),
+    var notifyRender: Render = Render(
+        mode = "breath", patternSync = true,
+        patternCur = Triple(15, 11, 11)
+    ),
+    var missedRender: Render = Render(
+        mode = "breath", patternSync = false,
+        patternCur = Triple(15, 15, 15)
+    ),
+    var alarmRender: Render = Render(
+        mode = "breath", patternSync = false,
+        patternCur = Triple(15, 15, 15)
+    ),
+    var ringRender: Render = Render(
+        mode = "wave", patternSync = false,
+        patternCur = Triple(15, 15, 15)
+    ).callTiming(),
+    var voipRender: Render = Render(
+        mode = "wave", patternSync = false,
+        patternCur = Triple(15, 15, 15)
+    ).callTiming(),
     var alarmColor: Triple<Int, Int, Int> = Triple(255, 155, 0),
     var alarmMaxSec: Long = 0,
-    var missedColor: Triple<Int, Int, Int> = Triple(255, 0, 0),
+    var missedColor: Triple<Int, Int, Int> = Triple(0, 255, 255),
     var missedMaxSec: Long = 0,
     /** [preview] calibration: apparent per-LED brightness vs green=100
      *  and the perception-curve exponent. Only the GUI picture uses these
@@ -123,6 +176,31 @@ data class LedConf(
     companion object {
         const val CONF_PATH = "/data/adb/modules/led_hal_root/led.conf"
         val VALID_MODES = setOf("off", "solid", "breath", "wave")
+
+        /** Tokens of a render line that follow its colour: mode, the solid
+         *  current, the literal pattern marker and the preset breath and
+         *  wave share. The [rules] tail is the same fields after the cap. */
+        const val RENDER_FIELDS = 17
+
+        /** Every section this model owns. An unknown section is reported and
+         *  left out of the model, so a save leaves the file's copy of it
+         *  exactly as the operator wrote it. */
+        val KNOWN_SECTIONS = setOf(
+            "priority", "suppress", "rules", "charge",
+            "charge.lower", "charge.middle", "charge.upper",
+            "notify", "ring", "voip", "missed", "alarm", "led", "preview"
+        )
+
+        /** The AW2033 current steps the chip driver can program; [imax] must
+         *  be one of these or the daemon refuses to power the rails. */
+        val VALID_IMAX = setOf(5, 10, 15, 30)
+
+        /** The whole [priority] vocabulary: render order = rank order.
+         *  Values mirror RANK_* in led_hal_root/chgd.h. */
+        val PRIORITY_EFFECTS = listOf(
+            "ring" to 50, "voip" to 40, "alarm" to 30,
+            "missed" to 20, "notify" to 10, "charge" to 0
+        )
 
         /** App-wide settings cache: every config tab shares ONE LedConf so
          *  switching tabs never re-fetches the device file. Warm from the
@@ -141,11 +219,46 @@ data class LedConf(
             return conf
         }
 
-        fun load(): LedConf = readConf() ?: LedConf()
-
+        /** The device file, or null when it cannot be read. A caller that needs a
+         *  config MUST handle null (the daemon would run with nothing), so
+         *  there is deliberately no load() that invents one. */
         fun loadOrNull(): LedConf? = readConf()
 
         private fun clampColor(v: Int) = v.coerceIn(0, 255)
+    }
+
+    /** Parse complaints, shown by the page that owns the section. The GUI
+     *  has no log of its own, so an unreadable line must not be swallowed:
+     *  the daemon logs the same ones and falls back to the default rank. */
+    val warnings: MutableList<String> = mutableListOf()
+
+    private fun warn(msg: String) {
+        if (warnings.size < 8) warnings.add("warn: $msg")
+    }
+
+    /** The six effects in WINNING order: the rank the file gives, then the
+     *  shipped order as the tie-break - the chain the daemon walks in
+     *  channel.c. The shipped order is used ONLY to place a
+     *  key the file omits so the list stays complete and draggable; it is
+     *  never written back as a value the daemon would have had to guess.
+     *  setPriorityOrder() renumbers all six on the next save, which puts an
+     *  explicit rank in the file for every effect. */
+    fun priorityOrder(): List<String> {
+        val def = PRIORITY_EFFECTS.toMap()
+        return PRIORITY_EFFECTS
+            .sortedWith(compareByDescending<Pair<String, Int>> { priority[it.first] ?: it.second }
+                .thenByDescending { def[it.first] ?: 0 })
+            .map { it.first }
+    }
+
+    /** Write a row order as a clean descending ladder: the top row gets
+     *  n * 10, the bottom one 10. The order is the whole truth in the GUI,
+     *  so a save never has to reason about the numbers already on the
+     *  device - it just renumbers. */
+    fun setPriorityOrder(list: List<String>) {
+        val known = list.filter { name -> PRIORITY_EFFECTS.any { it.first == name } }
+        priority.clear()
+        known.forEachIndexed { i, name -> priority[name] = (known.size - i) * 10 }
     }
 
     private fun renderBySec(sec: String): Render? = when (sec) {
@@ -160,80 +273,106 @@ data class LedConf(
         else -> null
     }
 
-    private fun parseMode(v: String): String? = if (v.trim() in VALID_MODES) v.trim() else null
-
-    private fun parsePatternKey(r: Render, k: String, v: String) {
-        when (k) {
-            "repeat" -> v.toIntOrNull()?.let { r.patternRepeat = it.coerceIn(0, 15) }
-            "cur_r" -> v.toIntOrNull()?.let {
-                r.patternCur = Triple(it.coerceIn(0, 15), r.patternCur.second, r.patternCur.third)
-            }
-            "cur_g" -> v.toIntOrNull()?.let {
-                r.patternCur = Triple(r.patternCur.first, it.coerceIn(0, 15), r.patternCur.third)
-            }
-            "cur_b" -> v.toIntOrNull()?.let {
-                r.patternCur = Triple(r.patternCur.first, r.patternCur.second, it.coerceIn(0, 15))
-            }
-            "rise" -> v.toIntOrNull()?.let { r.patternRise = it }
-            "hold" -> v.toIntOrNull()?.let { r.patternHold = it }
-            "fall" -> v.toIntOrNull()?.let { r.patternFall = it }
-            "offt" -> v.toIntOrNull()?.let { r.patternOfft = it }
-            "sync" -> v.toIntOrNull()?.let { r.patternSync = it != 0 }
+    /** The RENDER_FIELDS tokens at [i] into [r], all of them or nothing:
+     *  mode, solid current, "pattern", sync, repeat, pattern current,
+     *  timing, wave phase offsets. A short line or an unknown mode stops
+     *  here, exactly where the daemon stops synthesizing that preset. */
+    private fun parseRenderTail(t: List<String>, i: Int, r: Render): Boolean {
+        if (t.size - i != RENDER_FIELDS) return false
+        val mode = t[i].trim()
+        if (mode !in VALID_MODES || t[i + 4].trim() != "pattern") return false
+        val v = IntArray(RENDER_FIELDS - 2)
+        var k = 0
+        for (f in 1 until RENDER_FIELDS) {
+            if (f == 4) continue
+            v[k++] = t[i + f].trim().toIntOrNull() ?: return false
         }
+        r.mode = mode
+        r.solidCur = Triple(v[0].coerceIn(0, 15), v[1].coerceIn(0, 15), v[2].coerceIn(0, 15))
+        r.patternSync = v[3] != 0
+        r.patternRepeat = v[4].coerceIn(0, 15)
+        r.patternCur = Triple(v[5].coerceIn(0, 15), v[6].coerceIn(0, 15), v[7].coerceIn(0, 15))
+        r.patternRise = v[8]
+        r.patternHold = v[9]
+        r.patternFall = v[10]
+        r.patternOfft = v[11]
+        r.waveT0 = Triple(v[12].coerceAtLeast(0), v[13].coerceAtLeast(0), v[14].coerceAtLeast(0))
+        return true
     }
 
-    private fun parseRenderSection(r: Render, kind: String, k: String, v: String) {
-        when (kind) {
-            "solid" -> if (k == "cur") parseTriple(v)?.let {
-                r.solidCur = Triple(
-                    it.first.coerceIn(0, 15), it.second.coerceIn(0, 15), it.third.coerceIn(0, 15)
-                )
-            }
-            "pattern" -> {
-                if (k == "t0") {
-                    parseTriple(v)?.let {
-                        r.waveT0 = Triple(
-                            it.first.coerceAtLeast(0), it.second.coerceAtLeast(0),
-                            it.third.coerceAtLeast(0)
-                        )
-                    }
-                } else parsePatternKey(r, k, v)
-            }
-            "breath" -> parsePatternKey(r, k, v)
-            "wave" -> {
-                if (r.mode == "wave" && k != "cur") r.patternCur = Triple(15, 15, 15)
-                if (k == "t0") {
-                    parseTriple(v)?.let {
-                        r.waveT0 = Triple(
-                            it.first.coerceAtLeast(0), it.second.coerceAtLeast(0),
-                            it.third.coerceAtLeast(0)
-                        )
-                    }
-                } else if (k == "cur") {
-                    parseTriple(v)?.let {
-                        r.patternCur = Triple(
-                            it.first.coerceIn(0, 15), it.second.coerceIn(0, 15),
-                            it.third.coerceIn(0, 15)
-                        )
-                    }
-                } else if (r.mode == "wave") {
-                    parsePatternKey(r, k, v)
-                }
-            }
+    /** One render= line: the section's colour goes to [color], the preset
+     *  into [r]. The colour survives a broken preset - the daemon reads it
+     *  the same way - but nothing of that preset is taken over. */
+    private fun parseRenderLine(sec: String, v: String, r: Render,
+                                color: (Triple<Int, Int, Int>) -> Unit) {
+        val t = v.split(',')
+        if (t.size != RENDER_FIELDS + 3) {
+            warn("[$sec] render= wants <r,g,b> and $RENDER_FIELDS preset fields, " +
+                 "got ${t.size} - the whole preset is ignored")
+            return
         }
+        parseRgb(t.subList(0, 3).joinToString(","))?.let(color)
+            ?: warn("[$sec] render= colour \"${t.subList(0, 3)}\" is not r,g,b in 0..255")
+        if (!parseRenderTail(t, 3, r))
+            warn("[$sec] render= preset fields are not mode/cur/pattern/sync/" +
+                 "repeat/cur/timing/t0 - the whole preset is ignored")
+    }
+
+    /** The file as the daemon reads it: '#' or ';' opens a comment (a line
+     *  of its own or right after a setting), and a value ending in a comma
+     *  continues on the next line (a trailing backslash says the same).
+     *  Fragments are trimmed and joined, so a value spread over several
+     *  commented lines is one logical line - exactly what config.c
+     *  assembles. */
+    private fun logicalLines(text: String): List<String> {
+        val out = ArrayList<String>()
+        val cur = StringBuilder()
+        var open = false
+        for (raw in text.lineSequence()) {
+            val line = raw.substringBefore('#').substringBefore(';').trim()
+            val more = line.endsWith("\\") || line.endsWith(",")
+            val frag = if (line.endsWith("\\")) line.dropLast(1).trim() else line
+            if (open && !more && frag.isEmpty()) continue
+            cur.append(frag)
+            open = more
+            if (more) continue
+            if (cur.isNotBlank()) out.add(cur.toString())
+            cur.setLength(0)
+        }
+        if (cur.isNotBlank()) out.add(cur.toString())
+        return out
     }
 
     fun parse(text: String) {
+        warnings.clear()
         var section = ""
-        for (rawLine in text.lineSequence()) {
-            val line = rawLine.trim()
-            if (line.isEmpty() || line.startsWith("#") || line.startsWith(";")) continue
+        for (line in logicalLines(text)) {
             if (line.startsWith("[")) {
                 val end = line.indexOf(']')
                 section = if (end > 1) line.substring(1, end) else ""
                 continue
             }
             when (section) {
+                "priority" -> {
+                    val i = line.indexOf('=')
+                    if (i <= 0) continue
+                    val k = line.substring(0, i).trim()
+                    val raw = line.substring(i + 1).trim()
+                    // An unknown name and a non-number are both the
+                    // daemon's business: channel.c warns and leaves the
+                    // kind unranked, and so do we - but we say so,
+                    // because a silently dropped line looks like a GUI bug.
+                    if (PRIORITY_EFFECTS.none { it.first == k }) {
+                        warn("[priority] unknown effect \"$k\" ignored")
+                        continue
+                    }
+                    val v = raw.toIntOrNull()
+                    if (v == null) {
+                        warn("[priority] $k=\"$raw\" is not a number - using the default rank")
+                        continue
+                    }
+                    priority[k] = v
+                }
                 "suppress" -> {
                     if (line.isNotBlank() && !suppress.contains(line)) suppress.add(line)
                 }
@@ -263,8 +402,7 @@ data class LedConf(
                     val v = line.substring(i + 1).trim()
                     val r = renderBySec(section) ?: continue
                     when (k) {
-                        "mode" -> parseMode(v)?.let { r.mode = it }
-                        "color" -> parseRgb(v)?.let {
+                        "render" -> parseRenderLine(section, v, r) {
                             if (section == "charge.lower") lowerColor = it
                             else if (section == "charge.middle") middleColor = it
                             else upperColor = it
@@ -277,10 +415,9 @@ data class LedConf(
                     val k = line.substring(0, i).trim()
                     val v = line.substring(i + 1).trim()
                     when (k) {
-                        "notif_max_sec" -> v.toLongOrNull()?.let { notifMaxSec = it }
+                        "max_sec" -> v.toLongOrNull()?.let { notifMaxSec = it }
                         "notify_screen_delay_ms" -> v.toLongOrNull()?.let { notifyScreenDelayMs = it }
-                        "default_color" -> parseRgb(v)?.let { notifyColor = it }
-                        "mode" -> parseMode(v)?.let { notifyRender.mode = it }
+                        "render" -> parseRenderLine(section, v, notifyRender) { notifyColor = it }
                     }
                 }
                 "ring" -> {
@@ -290,8 +427,7 @@ data class LedConf(
                     val v = line.substring(i + 1).trim()
                     when (k) {
                         "max_sec" -> v.toLongOrNull()?.let { ringCapSec = it }
-                        "color" -> parseRgb(v)?.let { ringColor = it }
-                        "mode" -> parseMode(v)?.let { ringRender.mode = it }
+                        "render" -> parseRenderLine(section, v, ringRender) { ringColor = it }
                     }
                 }
                 "voip" -> {
@@ -301,8 +437,7 @@ data class LedConf(
                     val v = line.substring(i + 1).trim()
                     when (k) {
                         "max_sec" -> v.toLongOrNull()?.let { voipMaxSec = it }
-                        "color" -> parseRgb(v)?.let { voipColor = it }
-                        "mode" -> parseMode(v)?.let { voipRender.mode = it }
+                        "render" -> parseRenderLine(section, v, voipRender) { voipColor = it }
                     }
                 }
                 "missed" -> {
@@ -311,9 +446,8 @@ data class LedConf(
                     val k = line.substring(0, i).trim()
                     val v = line.substring(i + 1).trim()
                     when (k) {
-                        "color" -> parseRgb(v)?.let { missedColor = it }
                         "max_sec" -> v.toLongOrNull()?.let { missedMaxSec = it }
-                        "mode" -> parseMode(v)?.let { missedRender.mode = it }
+                        "render" -> parseRenderLine(section, v, missedRender) { missedColor = it }
                     }
                 }
                 "alarm" -> {
@@ -322,9 +456,8 @@ data class LedConf(
                     val k = line.substring(0, i).trim()
                     val v = line.substring(i + 1).trim()
                     when (k) {
-                        "color" -> parseRgb(v)?.let { alarmColor = it }
                         "max_sec" -> v.toLongOrNull()?.let { alarmMaxSec = it }
-                        "mode" -> parseMode(v)?.let { alarmRender.mode = it }
+                        "render" -> parseRenderLine(section, v, alarmRender) { alarmColor = it }
                     }
                 }
 "led" -> {
@@ -334,7 +467,16 @@ data class LedConf(
                     val v = line.substring(i + 1).trim()
                     when (k) {
                         "logging" -> v.toIntOrNull()?.let { logging = it != 0 }
-                        "imax" -> v.toIntOrNull()?.let { imax = it.coerceIn(1, 40) }
+                        // imax is the chip current ceiling and the daemon
+                        // accepts only the four hardware steps; keep an
+                        // illegal value visible as a warning instead of
+                        // rewriting it, so the file says what is actually
+                        // broken (the daemon then leaves the chip off).
+                        "imax" -> {
+                            val n = v.toIntOrNull()
+                            if (n != null && n in VALID_IMAX) imax = n
+                            else warn("[led] imax=\"$v\" is not 5|10|15|30 - the daemon leaves the chip unpowered")
+                        }
                     }
                 }
                 "preview" -> {
@@ -351,18 +493,9 @@ data class LedConf(
                         "gamma" -> pvwGamma = v.coerceIn(1.0, 4.0)
                     }
                 }
-                else -> {
-                    val dot = section.lastIndexOf('.')
-                    if (dot > 0) {
-                        val r = renderBySec(section.substring(0, dot))
-                        if (r != null) {
-                            val i = line.indexOf('=')
-                            if (i > 0) parseRenderSection(
-                                r, section.substring(dot + 1),
-                                line.substring(0, i).trim(), line.substring(i + 1).trim()
-                            )
-                        }
-                    }
+                else -> if (section.isNotEmpty() && line.indexOf('=') > 0 &&
+                    section !in KNOWN_SECTIONS) {
+                    warn("[$section] is not a section this GUI edits - left as it is")
                 }
             }
         }
@@ -372,237 +505,134 @@ data class LedConf(
         LedSim.cal = LedSim.Cal(pvwR / 100.0, pvwG / 100.0, pvwB / 100.0, pvwGamma)
     }
 
-    /** Parse one [rules] value ("r,g,b[,cap[,mode[,...]]]").
-     *  The tail is positional and left-prefix exactly like the daemon's.
-     *  New custom lines carry one named pattern block; the old two-block
-     *  breath/wave tail is still accepted and is collapsed on the next save. */
+    /** Parse one [rules] value ("r,g,b[,cap,<the render fields>]").
+     *  The tail is the render line without its colour, so it is read by the
+     *  same parser and is all-or-nothing: a tail that does not carry every
+     *  field leaves the rule colour-only, which is what the daemon does with
+     *  it. Growing a preset the file never fully said would silently change
+     *  the light, so it is reported instead. */
     private fun parseRuleValue(pkg: String, value: String): Rule? {
         val t = value.split(',')
         if (t.size < 3) return null
         val r = clampColor(t[0].trim().toIntOrNull() ?: return null)
         val g = clampColor(t[1].trim().toIntOrNull() ?: return null)
         val b = clampColor(t[2].trim().toIntOrNull() ?: return null)
+        if (t.size == 3) return Rule(pkg, r, g, b)
+        val cap = t[3].trim().toLongOrNull()
+        if (cap == null || cap < 0) {
+            warn("$pkg: cap=\"${t[3].trim()}\" is not max_sec - " +
+                 "the rule keeps its colour only")
+            return Rule(pkg, r, g, b)
+        }
         val render = Render()
-        var cap = -1L
-        var stopped = false
-        var i = 3
-
-        fun next(): Long? = if (i < t.size) t[i++].trim().toLongOrNull() else null
-        fun slot(assign: (Long) -> Unit) {
-            if (stopped) return
-            val v = next()
-            if (v == null) stopped = true else assign(v)
+        if (!parseRenderTail(t, 4, render)) {
+            warn("$pkg: preset tail is not mode/cur/pattern/sync/repeat/cur/" +
+                 "timing/t0 - the rule keeps its colour only")
+            return Rule(pkg, r, g, b)
         }
-        fun tripleSlot(assign: (Triple<Int, Int, Int>) -> Unit) {
-            if (stopped) return
-            val a = next() ?: run { stopped = true; return@tripleSlot }
-            val b = next() ?: run { stopped = true; return@tripleSlot }
-            val c = next() ?: run { stopped = true; return@tripleSlot }
-            assign(Triple(a.toInt().coerceIn(0, 15), b.toInt().coerceIn(0, 15),
-                          c.toInt().coerceIn(0, 15)))
-        }
-        fun phaseSlot(assign: (Triple<Int, Int, Int>) -> Unit) {
-            if (stopped) return
-            val a = next() ?: run { stopped = true; return@phaseSlot }
-            val b = next() ?: run { stopped = true; return@phaseSlot }
-            val c = next() ?: run { stopped = true; return@phaseSlot }
-            assign(Triple(a.toInt().coerceAtLeast(0), b.toInt().coerceAtLeast(0),
-                          c.toInt().coerceAtLeast(0)))
-        }
-
-        slot { cap = it }
-        if (!stopped) {
-            if (i < t.size) {
-                val m = t[i].trim()
-                if (m in VALID_MODES) { render.mode = m; i++ } else stopped = true
-            }
-        }
-        tripleSlot { render.solidCur = it }
-
-        val markedPattern = !stopped && i < t.size && t[i].trim() == "pattern"
-        if (markedPattern) i++
-        val newTail = markedPattern || (!stopped && t.size - i == 12)
-        if (newTail) {
-            slot { render.patternSync = it != 0L }
-            slot { render.patternRepeat = it.toInt().coerceIn(0, 15) }
-            tripleSlot { render.patternCur = it }
-            slot { render.patternRise = it.toInt() }
-            slot { render.patternHold = it.toInt() }
-            slot { render.patternFall = it.toInt() }
-            slot { render.patternOfft = it.toInt() }
-            phaseSlot { render.waveT0 = it }
-        } else if (!stopped) {
-            slot { render.patternSync = it != 0L }
-            slot { render.patternRepeat = it.toInt().coerceIn(0, 15) }
-            tripleSlot { render.patternCur = it }
-            slot { render.patternRise = it.toInt() }
-            slot { render.patternHold = it.toInt() }
-            slot { render.patternFall = it.toInt() }
-            slot { render.patternOfft = it.toInt() }
-
-            var waveSync: Long? = null
-            var waveRepeat: Int? = null
-            var waveRise: Int? = null
-            var waveHold: Int? = null
-            var waveFall: Int? = null
-            var waveOfft: Int? = null
-            var wavePhase: Triple<Int, Int, Int>? = null
-            slot { waveSync = it }
-            phaseSlot { wavePhase = it }
-            slot { waveRepeat = it.toInt().coerceIn(0, 15) }
-            slot { waveRise = it.toInt() }
-            slot { waveHold = it.toInt() }
-            slot { waveFall = it.toInt() }
-            slot { waveOfft = it.toInt() }
-            wavePhase?.let { render.waveT0 = it }
-            if (render.mode == "wave") {
-                render.patternCur = Triple(15, 15, 15)
-                waveSync?.let { render.patternSync = it != 0L }
-                waveRepeat?.let { render.patternRepeat = it }
-                waveRise?.let { render.patternRise = it }
-                waveHold?.let { render.patternHold = it }
-                waveFall?.let { render.patternFall = it }
-                waveOfft?.let { render.patternOfft = it }
-            }
-        }
-
-        val custom = cap >= 0
-        return Rule(
-            pkg, r, g, b,
-            maxSec = if (custom) cap else 0L,
-            render = render,
-            custom = custom
-        )
+        return Rule(pkg, r, g, b, maxSec = cap, render = render, custom = true)
     }
 
-    /** One [rules] line: color always, the full preset when custom. */
-    private fun ruleLine(rule: Rule): String {
+    /** One [rules] value: colour always, the full preset when custom. */
+    private fun ruleValue(rule: Rule): String {
         val sb = StringBuilder()
-        sb.append(rule.pkg).append('=')
-            .append(rule.r).append(',').append(rule.g).append(',').append(rule.b)
+        sb.append(rule.r).append(',').append(rule.g).append(',').append(rule.b)
         if (rule.custom) {
-            val r = rule.render
             sb.append(',').append(rule.maxSec)
-            sb.append(',').append(r.mode)
-            sb.append(',').append(tripleClamp(r.solidCur, 0, 15))
-            sb.append(",pattern,")
-            sb.append(if (r.patternSync) 1 else 0)
-            sb.append(',').append(r.patternRepeat.coerceIn(0, 15))
-            sb.append(',').append(tripleClamp(r.patternCur, 0, 15))
-            sb.append(',').append(r.patternRise).append(',').append(r.patternHold)
-                .append(',').append(r.patternFall).append(',').append(r.patternOfft)
-            sb.append(',').append(r.waveT0.first.coerceAtLeast(0)).append(',')
-                .append(r.waveT0.second.coerceAtLeast(0)).append(',')
-                .append(r.waveT0.third.coerceAtLeast(0))
+            sb.append(',').append(renderTail(rule.render))
         }
         return sb.toString()
     }
 
-    fun render(): String {
-        val sb = StringBuilder()
-        sb.append("# led_hal_root runtime config - generated by LED GUI (v5)\n")
-        sb.append("# ASCII only. Save applies on the next daemon event (mtime reload).\n")
-        sb.append("#\n")
-        sb.append("# [suppress] one package per line - never lights the LED\n")
-        sb.append("# [rules]    pkg=r,g,b  (0-255 per channel)\n")
-        sb.append("#            + optional own preset tail: cap, mode,\n")
-        sb.append("#            solid_cur, pattern, t0 (see header for layout)\n")
-        sb.append("# [charge]   thresholds ONLY; each band owns color/timing\n")
-        sb.append("# [notify]   shared behavior: notif_max_sec, default color\n")
-        sb.append("# [ring]     incoming call rainbow: max_sec, base color\n")
-        sb.append("# [voip]     messenger call rainbow: max_sec, base color\n")
-        sb.append("# [led]      daemon logging + global chip Imax\n")
-        sb.append("# [missed]   missed-call indication: color, max_sec\n")
-        sb.append("# [alarm]    alarm clock indication: color, max_sec\n")
-        sb.append("#\n")
-        sb.append("# v5 renderer: every event owns [sec] mode plus one shared\n")
-        sb.append("# [sec.pattern] preset for breath and wave. t0 applies only\n")
-        sb.append("# to wave; solid current stays in [sec.solid].\n")
-        sb.append("\n[suppress]\n")
-        for (p in suppress) sb.append(p).append('\n')
-        sb.append("\n[rules]\n")
-        for (rule in rules) {
-            sb.append(ruleLine(rule)).append('\n')
-        }
-        sb.append("\n[charge]\n")
-        sb.append("first_threshold=").append(firstThreshold).append('\n')
-        sb.append("second_threshold=").append(secondThreshold).append('\n')
-        appendBandRender(sb, "lower", chargeLower, lowerColor)
-        appendBandRender(sb, "middle", chargeMiddle, middleColor)
-        appendBandRender(sb, "upper", chargeUpper, upperColor)
-        sb.append("\n[notify]\n")
-        sb.append("notif_max_sec=").append(notifMaxSec).append('\n')
-        sb.append("notify_screen_delay_ms=").append(notifyScreenDelayMs).append('\n')
-        sb.append("default_color=").append(rgb(notifyColor)).append('\n')
-        appendMode(sb, "notify", notifyRender)
-        sb.append("\n[ring]\n")
-        sb.append("max_sec=").append(ringCapSec).append('\n')
-        sb.append("color=").append(rgb(ringColor)).append('\n')
-        appendMode(sb, "ring", ringRender)
-        sb.append("\n[voip]\n")
-        sb.append("max_sec=").append(voipMaxSec).append('\n')
-        sb.append("color=").append(rgb(voipColor)).append('\n')
-        appendMode(sb, "voip", voipRender)
-        sb.append("\n[led]\n")
-        sb.append("logging=").append(if (logging) 1 else 0).append('\n')
-        sb.append("imax=").append(imax).append('\n')
-        sb.append("\n# GUI preview calibration (daemon ignores): how bright each\n")
-        sb.append("# LED looks vs the picker value. green=100 is the reference;\n")
-        sb.append("# gamma bends the curve toward your eye. Tune to your LED set.\n")
-        sb.append("[preview]\n")
-        sb.append("r=").append(fmtW(pvwR)).append('\n')
-        sb.append("g=").append(fmtW(pvwG)).append('\n')
-        sb.append("b=").append(fmtW(pvwB)).append('\n')
-        sb.append("gamma=").append(String.format(Locale.US, "%.1f", pvwGamma)).append('\n')
-        appendRenderChips(sb, "notify", notifyRender)
-        appendRenderChips(sb, "ring", ringRender)
-        appendRenderChips(sb, "voip", voipRender)
-        sb.append("\n[missed]\n")
-        sb.append("color=").append(rgb(missedColor)).append('\n')
-        sb.append("max_sec=").append(missedMaxSec).append('\n')
-        appendMode(sb, "missed", missedRender)
-        appendRenderChips(sb, "missed", missedRender)
-        sb.append("\n[alarm]\n")
-        sb.append("color=").append(rgb(alarmColor)).append('\n')
-        sb.append("max_sec=").append(alarmMaxSec).append('\n')
-        appendMode(sb, "alarm", alarmRender)
-        appendRenderChips(sb, "alarm", alarmRender)
-        return sb.toString()
-    }
-
-    /** [sec] mode=... */
-    private fun appendMode(sb: StringBuilder, sec: String, r: Render) {
-        sb.append("mode=").append(r.mode).append('\n')
-    }
-
-    /** one charge band's OWN renderer: [charge.<band>] mode + color
-     *  header + the three chip sections (each chip owns its timing). */
-    private fun appendBandRender(sb: StringBuilder, band: String, r: Render, color: Triple<Int, Int, Int>) {
-        sb.append("\n[charge.").append(band).append("]\n")
-        appendMode(sb, "charge.$band", r)
-        sb.append("color=").append(rgb(color)).append('\n')
-        appendRenderChips(sb, "charge.$band", r)
-    }
-
-    private fun appendRenderChips(sb: StringBuilder, sec: String, r: Render) {
-        sb.append("\n[").append(sec).append(".solid]\n")
-        sb.append("cur=").append(tripleClamp(r.solidCur, 0, 15)).append('\n')
-        sb.append("\n[").append(sec).append(".pattern]\n")
-        sb.append("sync=").append(if (r.patternSync) 1 else 0).append('\n')
-        sb.append("repeat=").append(r.patternRepeat.coerceIn(0, 15)).append('\n')
-        sb.append("cur_r=").append(r.patternCur.first.coerceIn(0, 15)).append('\n')
-        sb.append("cur_g=").append(r.patternCur.second.coerceIn(0, 15)).append('\n')
-        sb.append("cur_b=").append(r.patternCur.third.coerceIn(0, 15)).append('\n')
-        sb.append("rise=").append(r.patternRise).append('\n')
-        sb.append("hold=").append(r.patternHold).append('\n')
-        sb.append("fall=").append(r.patternFall).append('\n')
-        sb.append("offt=").append(r.patternOfft).append('\n')
-        sb.append("t0=").append(r.waveT0.first.coerceAtLeast(0)).append(',')
+    /** The RENDER_FIELDS preset tokens: the shared vocabulary behind both
+     *  the section render= line and the [rules] tail, so the two can never
+     *  drift apart. */
+    private fun renderTail(r: Render): String = buildString {
+        append(r.mode)
+        append(',').append(tripleClamp(r.solidCur, 0, 15))
+        append(",pattern,")
+        append(if (r.patternSync) 1 else 0)
+        append(',').append(r.patternRepeat.coerceIn(0, 15))
+        append(',').append(tripleClamp(r.patternCur, 0, 15))
+        append(',').append(r.patternRise).append(',').append(r.patternHold)
+        append(',').append(r.patternFall).append(',').append(r.patternOfft)
+        append(',').append(r.waveT0.first.coerceAtLeast(0)).append(',')
             .append(r.waveT0.second.coerceAtLeast(0)).append(',')
-            .append(r.waveT0.third.coerceAtLeast(0)).append('\n')
+            .append(r.waveT0.third.coerceAtLeast(0))
     }
 
-    fun save(): Su.Result = Su.writeFile(CONF_PATH, render())
+    /** One section's whole renderer: colour first, then the preset. */
+    private fun renderLine(r: Render, color: Triple<Int, Int, Int>): String =
+        "${rgb(color)},${renderTail(r)}"
+
+    /** Every line this model owns, section by section: the whole of what a
+     *  save may write, and the only vocabulary it recognizes anywhere. */
+    private fun owned(): List<OwnedSection> = listOf(
+        OwnedSection("priority", PRIORITY_EFFECTS.map {
+            OwnedKey(it.first, (priority[it.first] ?: it.second).toString())
+        }),
+        OwnedSection("suppress", suppress.map { OwnedKey(it, null) }),
+        OwnedSection("rules", rules.map { OwnedKey(it.pkg, ruleValue(it)) }),
+        OwnedSection("charge", listOf(
+            OwnedKey("first_threshold", firstThreshold.toString()),
+            OwnedKey("second_threshold", secondThreshold.toString())
+        )),
+        OwnedSection("charge.lower", listOf(
+            OwnedKey("render", renderLine(chargeLower, lowerColor)))),
+        OwnedSection("charge.middle", listOf(
+            OwnedKey("render", renderLine(chargeMiddle, middleColor)))),
+        OwnedSection("charge.upper", listOf(
+            OwnedKey("render", renderLine(chargeUpper, upperColor)))),
+        OwnedSection("notify", listOf(
+            OwnedKey("max_sec", notifMaxSec.toString()),
+            OwnedKey("notify_screen_delay_ms", notifyScreenDelayMs.toString()),
+            OwnedKey("render", renderLine(notifyRender, notifyColor))
+        )),
+        OwnedSection("ring", listOf(
+            OwnedKey("max_sec", ringCapSec.toString()),
+            OwnedKey("render", renderLine(ringRender, ringColor))
+        )),
+        OwnedSection("voip", listOf(
+            OwnedKey("max_sec", voipMaxSec.toString()),
+            OwnedKey("render", renderLine(voipRender, voipColor))
+        )),
+        OwnedSection("missed", listOf(
+            OwnedKey("max_sec", missedMaxSec.toString()),
+            OwnedKey("render", renderLine(missedRender, missedColor))
+        )),
+        OwnedSection("alarm", listOf(
+            OwnedKey("max_sec", alarmMaxSec.toString()),
+            OwnedKey("render", renderLine(alarmRender, alarmColor))
+        )),
+        OwnedSection("led", listOf(
+            OwnedKey("logging", if (logging) "1" else "0"),
+            OwnedKey("imax", imax.toString())
+        )),
+        OwnedSection("preview", listOf(
+            OwnedKey("r", fmtW(pvwR)),
+            OwnedKey("g", fmtW(pvwG)),
+            OwnedKey("b", fmtW(pvwB)),
+            OwnedKey("gamma", String.format(Locale.US, "%.1f", pvwGamma))
+        ))
+    )
+
+    /** [text] - the device file - with this model's values put into it.
+     *  Lines the file already has are rewritten in place, keys it lacks are
+     *  added, entries the model dropped are removed, and every other byte
+     *  (comments, blank lines, section order, a key this GUI cannot name)
+     *  is left alone. */
+    fun patch(text: String): String = ConfWriter(text, owned()).write()
+
+    /** Patch the values into the file the device actually has, so a save
+     *  keeps the comments and the layout the file was written with. An
+     *  unreadable file is NOT rewritten from the model: that is the wipe
+     *  this avoids, and a save that cannot see the file must write none. */
+    fun save(): Su.Result {
+        val cur = Su.run("cat $CONF_PATH 2>/dev/null")
+        if (!cur.ok || cur.out.isBlank())
+            return Su.Result("cannot read $CONF_PATH - nothing written", 1)
+        return Su.writeFile(CONF_PATH, patch(cur.out))
+    }
 
     private fun rgb(c: Triple<Int, Int, Int>): String =
         "${clampColor(c.first)},${clampColor(c.second)},${clampColor(c.third)}"
@@ -626,5 +656,221 @@ data class LedConf(
         val g = parts[1].trim().toIntOrNull() ?: return null
         val b = parts[2].trim().toIntOrNull() ?: return null
         return Triple(r, g, b)
+    }
+}
+
+/** One line the model owns: [key] is the key (a package, for [rules] and
+ *  [suppress]) and [value] the text after '=', or null when the line is the
+ *  key alone. */
+private class OwnedKey(val key: String, val value: String?)
+
+/** One section of the model's vocabulary, in template order. */
+private class OwnedSection(val name: String, val keys: List<OwnedKey>)
+
+/**
+ * The in-place writer behind a save: it puts the model's values into the
+ * lines the file already has and adds only what is missing, so comments,
+ * blank lines, the section order and every key the GUI has no vocabulary
+ * for stay exactly where the operator put them.
+ *
+ * It works on LOGICAL lines - the group of physical rows the daemon
+ * assembles from a value spread over comma-terminated rows - and writes
+ * physical rows back: a value whose token count still fits is rewritten one
+ * fragment per row, each keeping its own comment. A value whose shape
+ * changed (a [rules] entry that grew or lost its preset tail) becomes a
+ * single row, because the old per-row comments would then describe fields
+ * that are no longer on them.
+ *
+ * The two list sections ([suppress] and [rules]) are set-valued: the model
+ * IS the list, so an entry the file has and the model does not is removed
+ * and one the model has and the file does not is added.
+ */
+private class ConfWriter(private val text: String, sections: List<OwnedSection>) {
+
+    /** A physical row: the code the daemon reads, the comment a save must
+     *  put back, and the raw line for a row nothing was patched into. */
+    private class Row(
+        val raw: String,
+        val indent: String,
+        val code: String,
+        val comment: String,
+        val col: Int,
+        val more: Boolean
+    )
+
+    /** One logical line: its rows, the section it belongs to, its key. */
+    private class Log(val rows: List<Row>, val section: String) {
+        val first: Row get() = rows.first()
+        val key: String = rows.first().code.substringBefore('=').trim()
+        /** the code as the daemon assembles it, fragments joined by comma */
+        val code: String = rows.joinToString(",") { it.code }
+        val header: String? = if (rows.first().code.startsWith("[")) {
+            val end = rows.first().code.indexOf(']')
+            if (end > 0) rows.first().code.substring(1, end).trim() else null
+        } else null
+    }
+
+    /** Sections whose entries the model owns as a set. */
+    private val lists = setOf("suppress", "rules")
+
+    private val owned = LinkedHashMap<String, OwnedSection>()
+    private val keys = HashMap<String, OwnedKey>()
+
+    init {
+        for (s in sections) {
+            owned[s.name] = s
+            for (k in s.keys) keys["${s.name} ${k.key}"] = k
+        }
+    }
+
+    fun write(): String {
+        val out = ArrayList<String>()
+        /** where a section's block ends in [out]: a key the file lacks goes
+         *  there, before the blank line that closes the block */
+        val blockEnd = HashMap<String, Int>()
+        /** output index right under a section header, for an empty one */
+        val headerAt = HashMap<String, Int>()
+        val written = HashSet<String>()
+        var section = ""
+
+        for (log in logicals()) {
+            val head = log.header
+            if (head != null) {
+                section = head
+                out.add(log.first.raw)
+                headerAt[section] = out.size
+                continue
+            }
+            val id = "$section ${log.key}"
+            val mine = keys[id]
+            if (mine == null && section in lists && log.first.code.isNotEmpty()) continue
+            if (mine != null) written.add(id)
+            out.addAll(if (mine == null || sameValue(log, mine)) {
+                log.rows.map { it.raw }
+            } else {
+                rewrite(log, mine)
+            })
+            if (log.rows.any { it.code.isNotEmpty() }) blockEnd[section] = out.size
+        }
+
+        // the file's own text is the base; what the model adds goes on top
+        val inserts = ArrayList<Pair<Int, List<String>>>()
+        val tail = ArrayList<String>()
+        for (s in this.owned.values) {
+            val missing = s.keys.filter { !written.contains("${s.name} ${it.key}") }
+            val block = missing.map { if (it.value == null) it.key else "${it.key}=${it.value}" }
+            val at = blockEnd[s.name] ?: headerAt[s.name]
+            when {
+                at != null && block.isEmpty() -> Unit
+                at != null -> inserts.add(at to block)
+                else -> {
+                    // a section the file has none of: header plus what is missing
+                    tail.add("")
+                    tail.add("[${s.name}]")
+                    tail.addAll(block)
+                }
+            }
+        }
+        for ((at, block) in inserts.sortedByDescending { it.first }) out.addAll(at, block)
+        out.addAll(tail)
+        return out.joinToString(if (text.contains("\r\n")) "\r\n" else "\n")
+    }
+
+    /** Whether the file's line already IS the value the model wants. A
+     *  space around a comma is not part of a value - the daemon trims every
+     *  token it reads - so a value that differs from the model's in nothing
+     *  else is left byte for byte, spacing and comment included. */
+    private fun sameValue(log: Log, mine: OwnedKey): Boolean =
+        log.key == mine.key &&
+            spaced(log.code.substringAfter('=', log.code)) == spaced(mine.value ?: mine.key)
+
+    private fun spaced(value: String) = value.split(',').joinToString(",") { it.trim() }
+
+    /** The rows that carry [mine]'s value. One row per old fragment while
+     *  the token count still fits, a single row otherwise. */
+    private fun rewrite(log: Log, mine: OwnedKey): List<String> {
+        val tokens = (mine.value ?: mine.key).split(',')
+        val bare = mine.value == null
+        val sizes = log.rows.mapIndexed { i, r ->
+            val code = if (bare || i > 0) r.code else r.code.substringAfter('=', "")
+            if (code.isEmpty()) -1 else code.count { it == ',' } + 1
+        }
+        if (sizes.any { it < 0 } || sizes.sum() != tokens.size) {
+            val one = if (bare) mine.key else "${mine.key}=${tokens.joinToString(",")}"
+            return listOf(log.first.indent + one)
+        }
+        val parts = ArrayList<String>(log.rows.size)
+        val before = ArrayList<Int>(log.rows.size)
+        var k = 0
+        log.rows.forEachIndexed { i, r ->
+            val body = tokens.subList(k, k + sizes[i]).joinToString(",")
+            k += sizes[i]
+            val head = when {
+                bare -> ""
+                i == 0 -> mine.key + "="
+                else -> ""
+            }
+            val tail = if (i < log.rows.size - 1) "," else ""
+            parts.add(r.indent + head + body + tail)
+            // a comment keeps the column it was written in
+            before.add(r.col)
+        }
+        val col = maxOf(parts.maxOf { it.length } + 2, before.maxOf { it })
+        return parts.mapIndexed { i, p ->
+            val comment = log.rows[i].comment
+            if (comment.isEmpty()) p else p.padEnd(col) + comment
+        }
+    }
+
+    /** The physical rows as logical lines: a value that continues on the
+     *  next row is one line, and a comment or blank row inside such a run
+     *  belongs to it exactly as it does for the daemon. */
+    private fun logicals(): List<Log> {
+        val rows = parse()
+        val out = ArrayList<Log>()
+        var section = ""
+        var i = 0
+        while (i < rows.size) {
+            val start = i
+            while (i + 1 < rows.size && rows[i].more) i++
+            val group = rows.subList(start, i + 1)
+            val head = group.first().code
+            if (head.startsWith("[")) {
+                val end = head.indexOf(']')
+                if (end > 0) section = head.substring(1, end).trim()
+            }
+            out.add(Log(group.toList(), section))
+            i++
+        }
+        return out
+    }
+
+    /** The rows with their terminators off: the file's own line ending is put
+     *  back once, when the rows are joined, so a rewritten row cannot end up
+     *  with a different one than the rows around it. */
+    private fun parse(): List<Row> = text.split('\n').map { line ->
+        val raw = line.removeSuffix("\r")
+        val at = commentAt(raw)
+        val head = if (at < 0) raw else raw.substring(0, at)
+        val code = head.trim()
+        val more = code.endsWith(",") || code.endsWith("\\")
+        Row(
+            raw = raw,
+            indent = head.takeWhile { it == ' ' || it == '\t' },
+            code = if (more) code.dropLast(1).trim() else code,
+            comment = if (at < 0) "" else raw.substring(at).trim(),
+            col = if (at < 0) 0 else at,
+            more = more
+        )
+    }
+
+    private fun commentAt(raw: String): Int {
+        val hash = raw.indexOf('#')
+        val semi = raw.indexOf(';')
+        return when {
+            hash < 0 -> semi
+            semi < 0 -> hash
+            else -> minOf(hash, semi)
+        }
     }
 }

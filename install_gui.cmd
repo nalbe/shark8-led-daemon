@@ -14,12 +14,8 @@ set "DST=%~dp0module\led_gui-release.apk"
 if not exist "%APK%" (
     echo APK not built - building with gradle...
     pushd "%GUI%"
-    where gradle >nul 2>nul
-    if errorlevel 1 (
-        call "D:\System\Apps\gradle-8.12\bin\gradle.bat" assembleRelease
-    ) else (
-        call gradle assembleRelease
-    )
+    rem gradlew ships with the project, so it needs nothing from PATH.
+    call gradlew.bat assembleRelease
     set "RC=!ERRORLEVEL!"
     popd
     if not "!RC!"=="0" (
@@ -29,6 +25,8 @@ if not exist "%APK%" (
 )
 
 echo Waiting for device...
+where adb >nul 2>nul
+if errorlevel 1 goto :noadb
 adb wait-for-device
 if errorlevel 1 goto :noadb
 
@@ -46,7 +44,7 @@ echo INSTALLED AND LAUNCHED
 exit /b 0
 
 :noadb
-echo adb not found in PATH (added: D:\System\Apps\adb - reopen the terminal)
+echo adb not found in PATH - add platform-tools and reopen the terminal
 exit /b 1
 
 :fail

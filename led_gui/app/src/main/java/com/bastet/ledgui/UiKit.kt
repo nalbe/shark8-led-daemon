@@ -78,8 +78,9 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
     protected val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     /** Pinned status banner above the scroll area, shown on every ConfPage
-     *  (Charge / Notification / Call / VoIP / Alarm) for a few seconds after
-     *  save / reload. Lives outside the ScrollView so it can never scroll away. */
+     *  (Charge / Notification / Call / VoIP / Alarm / Priority) for a few
+     *  seconds after save / reload. Lives outside the ScrollView so it can
+     *  never scroll away. */
     private lateinit var msgBanner: TextView
     private var msgHideJob: Job? = null
 
@@ -108,13 +109,10 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
     }
 
     /** This page was built before root answered (cold start right after a
-     *  grant, adbd restart, module reinstall). The old code loaded exactly
-     *  once at build time, so an empty page stayed empty - the app-wide
-     *  cache only ever got warm from the Info poll or a manual Reload, and
-     *  the Info poll only runs while that tab is VISIBLE. Retry in the
-     *  background until the device config answers, then paint once through
-     *  the shared cache so every page gets the same data. Bounded (~2 min)
-     *  so a truly rootless page does not hammer su forever. */
+     *  grant, adbd restart, module reinstall). Retry in the background until
+     *  the device config answers, then paint once through the shared cache
+     *  so every page gets the same data. Bounded (~2 min) so a truly
+     *  rootless page does not hammer su forever. */
     private fun selfHealWhenRoot() {
         scope.launch {
             for (attempt in 0 until 90) {
@@ -645,9 +643,8 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
     }
 
     /** Fixed-height internal-scroll list used inside a card: the card keeps
-     *  its size and a long list scrolls INSIDE the box (like the old
-     *  multiline text field) instead of stretching the page. Returns the
-     *  inner LinearLayout to fill with rows. */
+     *  its size and a long list scrolls INSIDE the box instead of stretching
+     *  the page. Returns the inner LinearLayout to fill with rows. */
     protected fun LinearLayout.scrollListBox(heightDp: Int = 176, stretch: Boolean = false): LinearLayout {
         val frame = FrameLayout(context)
         val scroll = object : ScrollView(context) {
@@ -713,12 +710,7 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
         return list
     }
 
-    /** Re-measure was NOT needed: a non-MATCH_PARENT child of a ScrollView
-     *  is measured UNSPECIFIED on this ROM too, so wrap-content rows keep
-     *  their natural height (child 775px in a 422px box = real range).
-     *  The scroll blocker was the outer page ScrollView stealing vertical
-     *  drags at touch-slop; fixed in scrollListBox via
-     *  requestDisallowInterceptTouchEvent on overflow. */
+    /** Plain rounded colour chip, filled in by the caller. */
     protected fun swatchView(sizeDp: Int): View {
         val v = View(context)
         val g = GradientDrawable()
@@ -1120,11 +1112,6 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
             onDriveChanged?.invoke()
         }
 
-        fun liveDrive(): Pair<Triple<Int, Int, Int>, Boolean> {
-            val m = modeNames[mode.get()]
-            return Pair(activeCur(), (m == "breath" || m == "wave") && patternSync.isChecked)
-        }
-
         private fun syncMode() {
             val m = modeNames[mode.get()]
             solidCard.visibility = if (m == "solid") VISIBLE else GONE
@@ -1172,12 +1159,13 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
     }
 
     /** The unified per-event "standard settings" template: color,
-     *  optional duration cap and the renderer card (mode + per-chip
-     *  params/timing). Every event tab uses this exact shape - variants
-     *  (charge bands, notify default/app, call/missed) and section
-     *  extras (thresholds, packages, pending window) bolt on around it.
-     *  color/cap map to the event's own LedConf fields by the owning
-     *  view; the chip timing lives inside the RenderCard. */
+     *  optional duration cap and the renderer card (mode, solid current
+     *  and the preset breath and wave share). Every event tab uses this
+     *  exact shape - variants (charge bands, notify default/app,
+     *  call/missed) and section extras (thresholds, packages, basin
+     *  window) bolt on around it. color/cap map to the event's own
+     *  LedConf fields by the owning view; the preset lives inside the
+     *  RenderCard. */
     protected inner class EventKnobs(
         colorTitle: String,
         rendererTitle: String,

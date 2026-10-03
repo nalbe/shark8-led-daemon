@@ -1,189 +1,64 @@
 /*
- * mods/ring.c - incoming/outgoing call rainbow mode.
+ * mods/ring.c - incoming/outgoing call rainbow.
  *
- * Entered on a RING_ON command from the NLS bridge (it classifies the
- * dialer's live-call notification) and exited on RING_OFF, which
- * resolves the call end back to plain charge leds; if the call was
- * missed, the bridge separately posts MISSED_ON for the tombstone and
- * the missed-call LED takes over on its own (see mods/missed.c).
- * Registers an adaptive timer MODE: while the pseudo-package is armed,
- * the core sleeps exactly until the [ring] max_sec cap (disarmed when
- * 0 = unlimited) and calls ring_tick() there.
- * Ring mode deliberately ignores the screen state (this ROM wakes the
- * display for incoming calls and the screen-on guard would kill the
- * effect); it exits on RING_OFF, timeout, or explicit disarm.
+ * RING_ON from the bridge pushes this kind's entry, RING_OFF drops it.
+ * A missed call arrives as MISSED_ON on its own kind.
  *
- * The rainbow itself runs on the AW2033 chip (traveling-wave mode via
- * led_wave_rgb): ring.c only arms it and resolves the outcome on end.
- * No per-tick LED code here. Everything is event-driven from the NLS
- * bridge - there is no telephony/dumpsys polling and no logdr focus
- * tracking anymore.
+ * A live call never waits behind the screen: the pool is not allowed to
+ * park a kind that declares EV_SCREEN_BYPASS, so a ringing phone lights
+ * up with the display on.
  *
- * Config: [ring] max_sec=<n> caps a ring rainbow (default 0 = unlimited).
- * A test rainbow holds until Disarm or the cap. Looked up through
- * config.c's generic kv store.
- *
- * The mode pattern is the extension seam for any LED "behavior" that is
- * driven by the timer rather than by a single arm/disarm:
- *   REGISTER_MODE("name", heartbeat_ms, owns_pkg_fn, tick_fn);
+ * Config: [ring] max_sec=<n> and the [ring] render= line, both required.
+ * max_sec is the budget of lit time: how long the rainbow may hold the
+ * LEDs, 0 = unlimited (until RING_OFF).
  */
 
 #include <stdio.h>
 #include <string.h>
-#include <time.h>
 #include "../chgd.h"
 
-#define INCOMING_PKG   "incoming.call"   /* pseudo-pkg: ring rainbow */
-#define RING_STEP_MS   1000      /* tick: cap checks only (chip animates) */
+/* the dialer reposts its call notification on every state refresh, so the
+ * same event arrives again and again: the label below is what the status
+ * file shows, the direction travels as the entry's payload */
+#define INCOMING_LABEL  "incoming.call"
+#define OUTGOING_LABEL  "outgoing.call"
 
-/* hard cap for a ring rainbow, seconds; [ring] max_sec in led.conf.
- * 0 (default) = unlimited: the rainbow runs for the whole telephony
- * call (a test rainbow then holds until Disarm). A cap only bounds a
- * pathological stuck state, and unlike the old RING_MAX_SEC path it
- * resolves the outcome instead of silently killing the LED. */
-static long ring_max_sec(void)
+/* [ring] max_sec: the budget of lit time, seconds. 0 = unlimited.
+ * Required key - without it the rainbow cannot be budgeted, so the pool
+ * drops the entry instead of blinking with an invented lifetime. */
+static long ring_cap_ms(struct evt *e)
 {
-    long v = conf_get_int("ring", "max_sec", 0);
-    return v > 0 ? v : 0;
+    long secs;
+    (void)e;
+    if (!conf_req_int("ring", "max_sec", 0, 86400, &secs)) return -1L;
+    return secs * 1000L;
 }
 
-static void ring_rgb(int *r, int *g, int *b)
+/* the wave, described: colours from [ring], timing from the section's
+ * render= line. The pool paints it and writes the status file. */
+static int ring_paint(struct evt *e, struct evt_paint *p)
 {
-    *r = 255; *g = 255; *b = 255;
-    const char *c = conf_get_str("ring", "color");
-    if (c && c[0] &&
-        sscanf(c, "%d,%d,%d", r, g, b) == 3) {
-        if (*r < 0) *r = 0; if (*r > 255) *r = 255;
-        if (*g < 0) *g = 0; if (*g > 255) *g = 255;
-        if (*b < 0) *b = 0; if (*b > 255) *b = 255;
-    }
+    int rgb[3];
+    if (!conf_req_color("ring", rgb)) return 0;
+    PAINT_SEC(p, "ring");
+    p->r = rgb[0];
+    p->g = rgb[1];
+    p->b = rgb[2];
+    /* RING_ON carries 1 incoming / 0 outgoing; a direction flip (answered)
+     * only relabels the entry, the wave keeps running */
+    PAINT_LABEL(p, strcmp(e->arg, "outgoing") ? INCOMING_LABEL : OUTGOING_LABEL);
+    return 1;
 }
 
-/* ---------------- mode state ---------------- */
+static const struct evt_kind ring_kind = {
+    .name     = "ring",
+    .def_rank = RANK_RING,
+    .flags    = EV_SINGLETON | EV_SCREEN_BYPASS,
+    .cap_ms   = ring_cap_ms,
+    .accept   = NULL,
+    .paint    = ring_paint,
+};
+REGISTER_EVT(ring_kind);
 
-/* 1 if the current rainbow was caused by an incoming (RINGING) call;
- * 0 for an outgoing (OFFHOOK) call. On end, incoming resolves to a missed
- * call check, outgoing just drops back to the charge leds. */
-static int g_ring_incoming;
-/* 1 when armed from a test hook: no live call semantics, the rainbow is
- * held until Disarm / USR2 (or the [ring] max_sec cap). */
-static int g_ring_test;
 
-int ring_is_active(void)
-{
-    return g_st.cur_pkg[0] && !strcmp(g_st.cur_pkg, INCOMING_PKG);
-}
 
-void arm_ring_ex(int incoming, int test)
-{
-    /* Duplicate RING_ON dedup: Android re-posts the dialer call
-     * notification on every state refresh, so NLS fires RING_ON for
-     * each post. Re-arming the already-running rainbow restarts the
-     * chip wave from phase 0 -> the LED visibly strobes mid-ring.
-     * Same-direction re-arms are pure noise: keep the current rainbow.
-     * A direction change (call answered: incoming -> outgoing) only
-     * flips the resolution flag for RING_OFF, no re-paint. Test arms
-     * always come from a fresh test_disarm(), so the guard never
-     * swallows them. */
-    if (!test && ring_is_active()) {
-        if (g_ring_incoming == incoming)
-            return;
-        g_ring_incoming = incoming;         /* reclassify, keep the wave */
-        LOGI("ring reclassified: %s",
-             incoming ? "incoming" : "outgoing");
-        return;
-    }
-    g_applied_band[0] = '\0';       /* charge leds must reapply after */
-    leds_all_off();                 /* kill breathing, all channels 0 */
-    g_ring_incoming = incoming;
-    g_ring_test = test;
-    snprintf(g_st.cur_pkg, sizeof(g_st.cur_pkg), "%s", INCOMING_PKG);
-    g_st.armed_at = time(NULL);
-    /* [ring] renderer: mode from [ring], color from the section, timing
-     * from the shared [ring.pattern] chip section */
-    int r, g, b;
-    ring_rgb(&r, &g, &b);
-    const char *engine = led_event("ring", r, g, b);
-    status_write("ring", "",
-                 incoming ? "incoming.call" : "outgoing.call",
-                 r, g, b, engine);
-    retune_timer();
-    LOGI("ring armed -> wave rainbow (%s%s)",
-         incoming ? "incoming" : "outgoing",
-         test ? ", test" : "");
-}
-
-void arm_ring(int incoming)
-{
-    arm_ring_ex(incoming, 0);
-}
-
-/* ---------------- call end (RING_OFF / live cap) ---------------- */
-
-/* Resolve a live call end: drop the rainbow and repaint the charge leds.
- * A missed call needs no follow-up here - the bridge classifies the
- * dialer's missed-call tombstone (channel "missed_calls") and posts
- * MISSED_ON on its own, so there is no verification window to reopen
- * and no call_log query. Event-driven: ring_tick -> cap, nls_cmd ->
- * RING_OFF. */
-static void ring_resolve(const char *why)
-{
-    g_st.cur_pkg[0] = '\0';
-    apply_charge_leds();
-    LOGI("ring ended (%s)", why);
-    retune_timer();
-}
-
-/* NLS RING_OFF: the dialer's last live-call notification is gone. Resolve
- * the outcome exactly like a call end. */
-void ring_off(void)
-{
-    if (!ring_is_active()) return;
-    if (g_ring_test) {
-        disarm_notification(&g_st, "ring_off");
-        return;
-    }
-    ring_resolve("RING_OFF");
-}
-
-/* ---------------- mode tick ---------------- */
-
-static int ring_owns(const char *pkg)
-{
-    return pkg && !strcmp(pkg, INCOMING_PKG);
-}
-
-static void ring_tick(void)
-{
-    /* [ring] max_sec: optional hard cap for the rainbow.
-     * 0 = unlimited; when a cap IS set, hitting it ends the rainbow.
-     * A live cap resolves the outcome exactly like a RING_OFF; a missed
-     * call landing right at the cap is still caught - the bridge posts
-     * MISSED_ON when the tombstone appears. A test rainbow is just
-     * disarmed - no missed-call side effects. The normal end of a live
-     * call is event-driven (RING_OFF from the NLS bridge), no polling
-     * here. */
-    long cap = ring_max_sec();
-    if (cap > 0 &&
-        difftime(time(NULL), g_st.armed_at) >= (double)cap) {
-        if (g_ring_test)
-            disarm_notification(&g_st, "max_sec");
-        else
-            ring_resolve("max_sec");
-    }
-}
-
-/* adaptive wakeup: sleep exactly until the [ring] max_sec cap; cap=0
- * means unlimited and the end is purely event-driven (RING_OFF), so no
- * timer at all - the core sleeps with the rainbow held */
-static long ring_next_wake(void)
-{
-    long cap = ring_max_sec();
-    if (cap <= 0) return 0;
-    double age = difftime(time(NULL), g_st.armed_at);
-    long remain = (long)(cap - age);
-    if (remain < 1) remain = 1;
-    return remain * 1000L;
-}
-
-REGISTER_MODE_WAKE("ring", RING_STEP_MS, ring_owns, ring_tick, ring_next_wake);

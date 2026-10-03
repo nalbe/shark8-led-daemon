@@ -1,8 +1,8 @@
 #!/system/bin/sh
-# led_hal_root v3.7.1 installer hook (KernelSU / Magisk compatible)
+# led_hal_root v4.3 installer hook (KernelSU / Magisk compatible)
 
 ui_print "- ==============================="
-ui_print "- Notification LED daemon v3.7.1"
+ui_print "- Notification LED daemon v4.3"
 ui_print "- AW2033 breathing LED, Shark8"
 ui_print "- ==============================="
 
@@ -17,13 +17,11 @@ set_perm "$MODPATH/chgd"         0 0 0755
 
 # Ship the notification bridge with the module: the standalone NotifyBridge APK
 # (headless, no GUI) makes the notification LED work even without the GUI.
-# NotifyBridge is the daemon's ONLY notification transport - without it there
-# is no notification LED (no logcat/event-log fallback exists). The GUI is
-# installed alongside as an optional configurator; its failure is
-# non-fatal, the NotifyBridge app is required.
+# NotifyBridge is the daemon's notification transport, so its install is
+# mandatory; the GUI is installed alongside as an optional configurator and
+# its failure is non-fatal.
 if [ -f "$MODPATH/notifybridge-release.apk" ]; then
     ui_print "- Installing NotifyBridge (notifybridge-release.apk)..."
-    # drop the pre-rename orphan packages if they somehow survived
     pm uninstall com.bastet.lednls >/dev/null 2>&1
     pm uninstall com.bastet.notybridge >/dev/null 2>&1
     pm install -r "$MODPATH/notifybridge-release.apk" >/dev/null 2>&1
@@ -54,16 +52,15 @@ ui_print "- Deploying notifybridge.json..."
 cp -f "$MODPATH/notifybridge.json" /data/local/tmp/notifybridge.json 2>/dev/null
 chmod 644 /data/local/tmp/notifybridge.json 2>/dev/null
 
-# clean stale runtime state from previous installs (no-op, harmless)
-rm -f /data/local/tmp/led_chg /data/local/tmp/led_chg.tmp
+# clean stale runtime state (no-op, harmless)
 rm -f /data/local/tmp/led_status /data/local/tmp/led_status.tmp
 rm -f /data/local/tmp/led_chgd.lock
 
 ui_print "- Per-event renderers: mode=off|solid|breath|wave"
 ui_print "-          for charge / notify / call / voip / missed / alarm"
 ui_print "- Colors: RGB-configurable in led.conf ([rules] per app)"
-ui_print "- Charge defaults: lower=breath red, middle=breath amber,"
-ui_print "-          upper=solid green (thresholds 70/95)"
+ui_print "- Charge defaults: all three bands start solid (red / amber /"
+ui_print "-          green), thresholds 70/95; every band owns its renderer"
 ui_print "- Everything editable in led.conf, no rebuild"
 ui_print "- Notifications: NotifyBridge (standalone) -"
 ui_print "-          works without GUI, any build type"

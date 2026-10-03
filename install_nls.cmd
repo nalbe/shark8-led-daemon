@@ -6,24 +6,26 @@ rem  drop it into the module packaging dir
 rem  (module\notifybridge-release.apk). customize.sh installs
 rem  notifybridge-release.apk alongside led_gui-release.apk.
 rem
-rem  The bridge is a STANDALONE project now
-rem  (projects\android-notify-bridge): this script only consumes its
-rem  artifact. Fix NLS below if you keep the bridge repo elsewhere.
+rem  The bridge is a STANDALONE project (sibling dir
+rem  ..\android-notify-bridge by default): this script only consumes
+rem  its artifact. Set NLS to the bridge repo if you keep it elsewhere:
+rem    set NLS=D:\somewhere\android-notify-bridge
 rem ============================================================
 setlocal enabledelayedexpansion
-set "NLS=%~dp0..\android-notify-bridge"
+if "%NLS%"=="" set "NLS=%~dp0..\android-notify-bridge"
+if not exist "%NLS%" (
+    echo ERROR: bridge project not found: %NLS%
+    echo   set NLS to the android-notify-bridge repo and rerun.
+    exit /b 1
+)
 set "APK=%NLS%\app\build\outputs\apk\release\notifybridge-release.apk"
 set "DST=%~dp0module\notifybridge-release.apk"
 
 rem Always rebuild so staged code is never stale on a rerun.
 echo Building notifybridge-release.apk...
 pushd "%NLS%"
-where gradle >nul 2>nul
-if errorlevel 1 (
-    call "D:\System\Apps\gradle-8.12\bin\gradle.bat" assembleRelease
-) else (
-    call gradle assembleRelease
-)
+rem gradlew ships with the bridge project, so it needs nothing from PATH.
+call gradlew.bat assembleRelease
 set "RC=!ERRORLEVEL!"
 popd
 if not "!RC!"=="0" (

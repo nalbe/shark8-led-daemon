@@ -1,17 +1,20 @@
 /*
  * led.c - thin adapter that turns events + led.conf into AW2033 calls.
  *
- * v3 = per-event renderer. There is no global "mode" anymore: every
- * event owns its [sec] section and led_event() reads the active mode
- * from that event's own section:
+ * Every event owns its [sec] section, and one render= line in it carries
+ * the whole renderer:
+ *
+ *   render=<r,g,b>,<mode>,<cur_r,g,b>,pattern,<sync>,<repeat>,
+ *          <cur_r,g,b>,<rise>,<hold>,<fall>,<offt>,<t0_r,g,b>
+ *
+ * config.c expands that line into the flat keys below (led.c never sees
+ * the line itself):
  *
  *   [sec]         mode=off|solid|breath|wave
  *   [sec.solid]   cur=r,g,b         0..15 per channel current
  *   [sec.pattern] repeat=0..15, cur_r/cur_g/cur_b,
  *                 rise/hold/fall/offt (ms), sync=0|1,
  *                 t0=r,g,b phase offsets (wave only)
- *
- * Legacy [sec.breath]/[sec.wave] sections remain readable as fallbacks.
  *
  * sync (breath/wave): the AW2033's per-channel pattern controllers
  * free-run on their own T0..T4, and because the rise/fall period grows
@@ -23,84 +26,89 @@
  * Trade-off: in sync mode the color is expressed through the per-channel
  * cur ratio, not the rgb PWM (rgb green/blue are ignored). Default 0.
  * The bit is managed explicitly on every paint (set in breath/wave to
- * the config value, cleared on solid/off), so a stale master bit can
- * never leak into a config that turned sync off.
+ * the config value, cleared on solid/off).
  *
- * Timing (rise/hold/fall/offt) belongs to [sec.pattern], shared by breath
- * and wave. The [led] section keeps only
- * chip/daemon globals: logging, imax.
+ * Timing (rise/hold/fall/offt) belongs to the preset, shared by breath and
+ * wave. The [led] section keeps only chip/daemon globals:
+ * logging, imax.
  *
- * No timer threads, no sysfs poking, no software animation - the
- * breathing, traveling-wave and solid modes all run inside the chip
- * itself via the aw2033 controller (lib\libaw2033.a from the standalone
- * aw2033-driver repo, vendored header lib\aw2033.h). Every
- * other module (core, charge, notify, ring) lights the LEDs ONLY
- * through the exported led_event() / leds_all_off() calls in chgd.h.
+ * The breathing, traveling-wave and solid modes all run inside the chip
+ * itself via the aw2033 controller (the vendored lib/libaw2033.a +
+ * lib/aw2033.h from the standalone aw2033-driver repo). Nothing else in
+ * the daemon touches the chip: the event pool (channel.c) is the only
+ * caller of led_event() / leds_all_off(), and this file owns the
+ * fingerprint of what is currently programmed, so a repost of the same
+ * payload keeps the running pattern instead of restarting it.
  *
  * Events only supply the color; everything else (timing, current, phase
- * offsets, repeat) comes from the [sec.*] chip sections. config.c treats
+ * offsets, repeat) comes from the section's render= line. config.c treats
  * any unknown [section] as mod-owned, so all of these read raw.
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include "chgd.h"
 #include "../lib/aw2033.h"
 
-/* clamp helper for the config knobs the sections let through */
-static int clampi(long v, int lo, int hi)
-{
-    if (v < lo) v = lo;
-    if (v > hi) v = hi;
-    return (int)v;
-}
-
 /* ---------------- strict preset readers ----------------
  *
- * No builtin timing/current/phase substitutes here. A chip section that
- * omits a key is a broken preset: painting it with a default produces
- * exactly the "LED blinks wrong and nothing is logged" class of bug.
+ * A preset key that is absent or illegal is a broken preset.
  * Every reader below reports the offending key and fails, and the
- * caller skips the event instead of guessing. */
+ * caller skips the event.
+ *
+ * Out of range is the same kind of broken: silently clamping cur=99 to 15
+ * or rise=99999 to the chip maximum would paint something the file never
+ * asked for, so a value outside its legal window is rejected and logged
+ * like a missing key. */
 
-/* required integer key: absent or non-numeric -> warn + fail */
-static int req_int(const char *sec, const char *key, long *out)
+/* required integer key inside lo..hi: absent, non-numeric or out of
+ * range -> warn + fail */
+static int req_int(const char *sec, const char *key, long lo, long hi,
+                   long *out)
 {
     const char *v = conf_get_str(sec, key);
     if (!v || !v[0]) {
-        LOGW("[led] %s: missing key %s", sec, key);
+        LOGI("warn: [led] %s: missing key %s", sec, key);
         return 0;
     }
     char *end = NULL;
     long x = strtol(v, &end, 10);
     if (end == v || *end) {
-        LOGW("[led] %s: key %s=\"%s\" is not a number", sec, key, v);
+        LOGI("warn: [led] %s: key %s=\"%s\" is not a number", sec, key, v);
+        return 0;
+    }
+    if (x < lo || x > hi) {
+        LOGI("warn: [led] %s: key %s=%ld is outside %ld..%ld",
+             sec, key, x, lo, hi);
         return 0;
     }
     *out = x;
     return 1;
 }
 
-/* required "a,b,c" key, clamped to lo..hi; absent or malformed -> warn
- * + fail. Reports every missing key in one line instead of one per key. */
+/* required "a,b,c" key, every channel inside lo..hi; absent, malformed
+ * or out of range -> warn + fail. One key per call, so a section with
+ * three broken keys says so three times. */
 static int req_triple(const char *sec, const char *key,
                       int *out, int lo, int hi)
 {
     const char *v = conf_get_str(sec, key);
     if (!v || !v[0]) {
-        LOGW("[led] %s: missing key %s", sec, key);
+        LOGI("warn: [led] %s: missing key %s", sec, key);
         return 0;
     }
     int a, b, c;
     if (sscanf(v, "%d,%d,%d", &a, &b, &c) != 3) {
-        LOGW("[led] %s: key %s=\"%s\" is not \"a,b,c\"", sec, key, v);
+        LOGI("warn: [led] %s: key %s=\"%s\" is not \"a,b,c\"", sec, key, v);
         return 0;
     }
-    out[0] = clampi(a, lo, hi);
-    out[1] = clampi(b, lo, hi);
-    out[2] = clampi(c, lo, hi);
+    if (a < lo || a > hi || b < lo || b > hi || c < lo || c > hi) {
+        LOGI("warn: [led] %s: key %s=%d,%d,%d has a channel outside %d..%d",
+             sec, key, a, b, c, lo, hi);
+        return 0;
+    }
+    out[0] = a; out[1] = b; out[2] = c;
     return 1;
 }
 
@@ -122,45 +130,40 @@ static aw_chip *led_hw(void)
 
 /* active [sec] renderer mode: explicit led.conf key only. A section
  * without mode= is a broken config, so it is reported and reported as
- * NULL - the caller skips the event instead of painting a breath nobody
- * asked for. */
+ * NULL - the caller skips the event. */
 static const char *led_active_mode(const char *sec)
 {
     const char *mode = conf_get_str(sec, "mode");
     if (!mode || !mode[0]) {
-        LOGW("[led] %s: missing key mode", sec);
+        LOGI("warn: [led] %s: missing key mode", sec);
         return NULL;
     }
     return mode;
 }
 
-/* the chip preset section to render from: [sec.pattern], or the legacy
- * [sec.breath]/[sec.wave] while old configs are still around. */
-static int led_pattern_sec(const char *sec, const char *legacy, char *out, size_t n)
+/* the chip preset section to render from: [sec.pattern], the section
+ * config.c built out of the section's render= line. */
+static int led_pattern_sec(const char *sec, char *out, size_t n)
 {
     snprintf(out, n, "%s.pattern", sec);
     if (conf_sec_exists(out)) return 1;
-    snprintf(out, n, "%s.%s", sec, legacy);
-    if (conf_sec_exists(out)) return 1;
-    LOGW("[led] %s: no [%s.pattern] and no legacy [%s.%s], event skipped",
-         sec, sec, sec, legacy);
+    LOGI("warn: [led] %s: no [%s] - the render= line was not read, "
+          "event skipped", sec, out);
     return 0;
 }
 
 /* optional "a,b,c" reader: 0 when the key is absent or malformed, and
  * the caller keeps its own value. Only for genuinely optional extras
- * (the wave cur= override a hand-written config may add) - never as a
- * substitute for a key the preset requires. */
+ * (the wave cur= override a hand-written config may add). */
 static int read_triple(const char *sec, const char *key,
-                       int *out, int lo, int hi)
+                        int *out, int lo, int hi)
 {
     const char *s = conf_get_str(sec, key);
     if (!s) return 0;
     int a, b, c;
     if (sscanf(s, "%d,%d,%d", &a, &b, &c) != 3) return 0;
-    out[0] = clampi(a, lo, hi);
-    out[1] = clampi(b, lo, hi);
-    out[2] = clampi(c, lo, hi);
+    if (a < lo || a > hi || b < lo || b > hi || c < lo || c > hi) return 0;
+    out[0] = a; out[1] = b; out[2] = c;
     return 3;
 }
 
@@ -193,21 +196,16 @@ static void led_breathe_rgb(const char *sec, int r, int g, int b)
     aw_chip *c = led_hw();
     char ss[128];
     long rise, hold, fall, offt, repeat, cur0, cur1, cur2, sync;
-    if (!led_pattern_sec(sec, "breath", ss, sizeof(ss))) return;
-    if (!req_int(ss, "rise",  &rise))  return;
-    if (!req_int(ss, "hold",  &hold))  return;
-    if (!req_int(ss, "fall",  &fall))  return;
-    if (!req_int(ss, "offt",  &offt))  return;
-    if (!req_int(ss, "repeat", &repeat)) return;
-    if (!req_int(ss, "cur_r", &cur0)) return;
-    if (!req_int(ss, "cur_g", &cur1)) return;
-    if (!req_int(ss, "cur_b", &cur2)) return;
-    if (!req_int(ss, "sync",  &sync))  return;
-    cur0 = clampi(cur0, 0, 15);
-    cur1 = clampi(cur1, 0, 15);
-    cur2 = clampi(cur2, 0, 15);
-    repeat = clampi(repeat, 0, 15);
-    sync = clampi(sync, 0, 1);
+    if (!led_pattern_sec(sec, ss, sizeof(ss))) return;
+    if (!req_int(ss, "rise",   0, AW_MAX_DELAY_MS, &rise))   return;
+    if (!req_int(ss, "hold",   0, AW_MAX_DELAY_MS, &hold))   return;
+    if (!req_int(ss, "fall",   0, AW_MAX_DELAY_MS, &fall))   return;
+    if (!req_int(ss, "offt",   0, AW_MAX_DELAY_MS, &offt))   return;
+    if (!req_int(ss, "repeat", 0, AW_TIME_CODES - 1, &repeat)) return;
+    if (!req_int(ss, "cur_r",  0, 15, &cur0)) return;
+    if (!req_int(ss, "cur_g",  0, 15, &cur1)) return;
+    if (!req_int(ss, "cur_b",  0, 15, &cur2)) return;
+    if (!req_int(ss, "sync",   0, 1,  &sync))  return;
     LOGI("[led] %s breathe rgb=%d,%d,%d t=%ld,%ld,%ld,%ldms cur=%ld,%ld,%ld rep=%ld sync=%ld",
          sec, r, g, b, rise, hold, fall, offt, cur0, cur1, cur2, repeat, sync);
     if (!c) return;
@@ -226,28 +224,23 @@ static void led_wave_rgb(const char *sec, int r, int g, int b)
     aw_chip *c = led_hw();
     char ss[128];
     long rise, hold, fall, offt, repeat, cur0, cur1, cur2, sync;
-    if (!led_pattern_sec(sec, "wave", ss, sizeof(ss))) return;
-    if (!req_int(ss, "rise",  &rise))  return;
-    if (!req_int(ss, "hold",  &hold))  return;
-    if (!req_int(ss, "fall",  &fall))  return;
-    if (!req_int(ss, "offt",  &offt))  return;
-    if (!req_int(ss, "repeat", &repeat)) return;
-    if (!req_int(ss, "cur_r", &cur0)) return;
-    if (!req_int(ss, "cur_g", &cur1)) return;
-    if (!req_int(ss, "cur_b", &cur2)) return;
-    if (!req_int(ss, "sync",  &sync))  return;
+    if (!led_pattern_sec(sec, ss, sizeof(ss))) return;
+    if (!req_int(ss, "rise",   0, AW_MAX_DELAY_MS, &rise))   return;
+    if (!req_int(ss, "hold",   0, AW_MAX_DELAY_MS, &hold))   return;
+    if (!req_int(ss, "fall",   0, AW_MAX_DELAY_MS, &fall))   return;
+    if (!req_int(ss, "offt",   0, AW_MAX_DELAY_MS, &offt))   return;
+    if (!req_int(ss, "repeat", 0, AW_TIME_CODES - 1, &repeat)) return;
+    if (!req_int(ss, "cur_r",  0, 15, &cur0)) return;
+    if (!req_int(ss, "cur_g",  0, 15, &cur1)) return;
+    if (!req_int(ss, "cur_b",  0, 15, &cur2)) return;
+    if (!req_int(ss, "sync",   0, 1,  &sync))  return;
     int zi[3];
-    if (!req_triple(ss, "t0", zi, 0, 65535)) return;
+    if (!req_triple(ss, "t0", zi, 0, AW_MAX_DELAY_MS)) return;
     long z[3] = { zi[0], zi[1], zi[2] };
     long rt[3] = { rise, rise, rise };
     long ht[3] = { hold, hold, hold };
     long ft[3] = { fall, fall, fall };
     long ot[3] = { offt, offt, offt };
-    cur0 = clampi(cur0, 0, 15);
-    cur1 = clampi(cur1, 0, 15);
-    cur2 = clampi(cur2, 0, 15);
-    repeat = clampi(repeat, 0, 15);
-    sync = clampi(sync, 0, 1);
     /* allow a plain cur=r,g,b triple too (GUI writes none for wave, but
      * hand-written configs may use the same key as solid) */
     int curc[3] = { (int)cur0, (int)cur1, (int)cur2 };
@@ -263,62 +256,121 @@ static void led_wave_rgb(const char *sec, int r, int g, int b)
     aw_breathe_ex(c, r, g, b, rt, ht, ft, ot, z, (int)repeat, 1, cur);
 }
 
-void leds_all_off(void)
+/* the chip's neutral state, without the public log line: every paint ends
+ * the previous run with it, so no stale pattern survives a handover */
+static void kill_all(aw_chip *c)
 {
-    aw_chip *c = led_hw();
-    LOGI("[led] all off");
-    if (c) {
-        aw_sync_mode(c, 0);
-        aw_all_off(c);
-    }
+    if (!c) return;
+    aw_sync_mode(c, 0);
+    aw_all_off(c);
 }
 
-/* per-event dispatch used by charge/notify/missed/alarm/ring/voip.
- * Resolves the active mode for [sec], paints, and returns the mode
- * string for the status file's engine field (NULL when the event was
- * skipped, which every caller already tolerates). Timing comes from the
- * chip sections themselves; the event only supplies sec + colors. */
+/* ---------------- applied fingerprint ----------------
+ * The pool calls led_event() again for every repaint of the same entry, and
+ * the bridge reposts notifications constantly. Programming the chip on
+ * each of those restarts the running pattern from phase 0, which reads as
+ * a strobe on a notification that is already showing. So the last applied
+ * state is remembered here and the chip is touched only when the visible
+ * state really changes. led_invalidate() drops the memory - the pool calls
+ * it whenever the LEDs change owner or led.conf was reloaded, which are
+ * exactly the cases where the chip must be reprogrammed no matter what the
+ * fingerprint says. */
+
+static struct {
+    char sec[128];      /* "" for the off state                */
+    char mode[16];
+    int  r, g, b;
+    int  valid;
+} g_applied;
+
+static void fp_set(const char *sec, const char *mode, int r, int g, int b)
+{
+    snprintf(g_applied.sec, sizeof(g_applied.sec), "%s", sec ? sec : "");
+    snprintf(g_applied.mode, sizeof(g_applied.mode), "%s", mode);
+    g_applied.r = r;
+    g_applied.g = g;
+    g_applied.b = b;
+    g_applied.valid = 1;
+}
+
+void led_invalidate(void)
+{
+    g_applied.valid = 0;
+}
+
+/* The one place that puts the LEDs into the neutral state, and it leaves
+ * the fingerprint saying exactly that: the pool's idle owner and the
+ * charge "none" band both come through here, so the next real paint must
+ * not be skipped as "already applied". */
+void leds_all_off(void)
+{
+    LOGI("[led] all off");
+    kill_all(led_hw());
+    fp_set("", "off", 0, 0, 0);
+}
+
+/* per-event dispatch used by every kind in the pool. Resolves the active
+ * mode for [sec], paints, and returns the mode string for the status
+ * file's engine field (NULL when the event was skipped, which the pool
+ * tolerates). Timing comes from the chip sections themselves; the event
+ * only supplies sec + colors. sec == NULL paints "off". */
 const char *led_event(const char *sec, int r, int g, int b)
 {
-    const char *mode = led_active_mode(sec);
+    const char *mode = sec ? led_active_mode(sec) : "off";
     if (!mode) return NULL;      /* no mode= -> warned, event skipped */
+    if (strcmp(mode, "off") && strcmp(mode, "solid") && strcmp(mode, "wave") &&
+        strcmp(mode, "breath")) {
+        /* An unknown mode word is a broken preset. */
+        LOGI("warn: [led] %s: unknown mode \"%s\", event skipped", sec, mode);
+        return NULL;
+    }
 
-    if (!strcmp(mode, "off"))
-        leds_all_off();
-    else if (!strcmp(mode, "solid"))
+    /* already on the chip: the run keeps its phase, the chip is untouched */
+    if (g_applied.valid && !strcmp(g_applied.mode, mode) &&
+        g_applied.r == r && g_applied.g == g && g_applied.b == b &&
+        !strcmp(g_applied.sec, sec ? sec : "")) {
+        return mode;
+    }
+
+    kill_all(led_hw());          /* nothing of the previous run survives */
+    if (!strcmp(mode, "solid"))
         led_solid_rgb(sec, r, g, b);
     else if (!strcmp(mode, "wave"))
         led_wave_rgb(sec, r, g, b);
     else if (!strcmp(mode, "breath"))
         led_breathe_rgb(sec, r, g, b);
-    else {
-        /* an unknown mode word used to fall through to breath */
-        LOGW("[led] %s: unknown mode \"%s\", event skipped", sec, mode);
-        return NULL;
-    }
+
+    fp_set(sec, mode, r, g, b);
     return mode;
 }
 
-/* mode resolution without painting: charge.c calls it to fold the active
- * mode into the applied-fingerprint, so editing only the renderer mode
- * in led.conf still repaints on the next refresh. */
-const char *led_resolve_mode(const char *sec)
-{
-    return led_active_mode(sec);
-}
-
-/* init: soft reset + power rails on (Imax from global [led] imax) */
+/* Init: soft reset + power rails on, at the global [led] imax current
+ * limit. imax is REQUIRED: the chip current ceiling
+ * is a hardware limit, so picking one the file did not name can either
+ * brown out the LED set or drive it past what the user wired. A missing
+ * or illegal value therefore leaves the rails OFF and logs - the daemon
+ * runs, reports the bad key, and no LED lights until led.conf names a
+ * legal limit. */
 void led_init_hw(void)
 {
     aw_chip *c = led_hw();
     if (!c) return;
     const char *s = conf_get_str("led", "imax");
-    int imax = AW_IMAX_30MA;
-    if (s && !strcmp(s, "5"))  imax = AW_IMAX_5MA;
-    if (s && !strcmp(s, "10")) imax = AW_IMAX_10MA;
-    if (s && !strcmp(s, "15")) imax = AW_IMAX_15MA;
+    int imax, ma;
+    if      (s && !strcmp(s, "5"))  { imax = AW_IMAX_5MA;  ma = 5;  }
+    else if (s && !strcmp(s, "10")) { imax = AW_IMAX_10MA; ma = 10; }
+    else if (s && !strcmp(s, "15")) { imax = AW_IMAX_15MA; ma = 15; }
+    else if (s && !strcmp(s, "30")) { imax = AW_IMAX_30MA; ma = 30; }
+    else {
+        LOGI("warn: [led] imax=%s is not 5|10|15|30 - chip left "
+             "unpowered until led.conf names a legal limit",
+             s ? s : "(unset)");
+        aw_rst(c);
+        return;
+    }
     aw_rst(c);
     aw_pwr(c, imax);
     aw_lctr(c, -1, 0);
-    LOGI("[led] aw2033 init imax=%s", s ? s : "30");
+    /* Log milliamps, not the GCR2 register code (0x01 is 30mA, not 1mA). */
+    LOGI("[led] aw2033 init imax=%dmA", ma);
 }

@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # led_hal_root: boot autostart of the LED daemon (chgd)
 #
-# No supervision anywhere: the NotyBridge app is a pure transport and
+# No supervision anywhere: the NotifyBridge app is a pure transport and
 # restarts nothing. This script only guarantees the daemon is up right
 # after boot; a crash mid-session stays down until reboot or manual
 # start (service.sh again).

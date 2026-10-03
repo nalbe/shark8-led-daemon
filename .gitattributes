@@ -7,3 +7,12 @@
 *.prop text eol=lf
 *.conf text eol=lf
 *.txt  text eol=lf
+# C sources get the same treatment, explicitly rather than via the bare
+# text=auto above: core.autocrlf=true would otherwise re-materialize them
+# with CRLF in the working copy (git check-attr then reports "eol:
+# unspecified" and a plain checkout silently undoes the LF cleanup).
+*.c    text eol=lf
+*.h    text eol=lf
+# .cmd stays CRLF: those are Windows batch files (build_module.cmd,
+# install_core.cmd) and text=auto is the right amount of normalization.
+*.cmd  text eol=crlf

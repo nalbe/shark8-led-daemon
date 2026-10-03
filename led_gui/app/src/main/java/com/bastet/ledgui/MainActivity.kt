@@ -21,14 +21,13 @@ import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 
 /**
-*  Classic-Views shell (Compose built no smooth 120Hz scrolling on this
- *  firmware; the plain View framework does). Six tabs: Info / Charge /
- *  Notification / Call / VoIP / Alarm, with a follow-the-finger
- *  drag pager in between.
+ *  Plain-Views shell (Compose does not scroll smoothly at 120Hz on this
+ *  firmware). Seven tabs: Info / Charge / Notification / Call / VoIP /
+ *  Alarm / Priority, with a follow-the-finger drag pager in between.
  */
 class MainActivity : ComponentActivity() {
 
-    private val tabs = arrayOf("Info", "Charge", "Notification", "Call", "VoIP", "Alarm")
+    private val tabs = arrayOf("Info", "Charge", "Notification", "Call", "VoIP", "Alarm", "Priority")
 
     private lateinit var statusView: StatusView
     private var chargeView: ChargeView? = null
@@ -36,10 +35,11 @@ class MainActivity : ComponentActivity() {
     private var callView: CallView? = null
     private var voipView: VoipView? = null
     private var alarmView: AlarmView? = null
+    private var priorityView: PriorityView? = null
     private lateinit var container: PagerContainer
     private val tabButtons = mutableListOf<Button>()
     private var currentIndex = 0
-    private val created = booleanArrayOf(false, false, false, false, false, false)
+    private val created = booleanArrayOf(false, false, false, false, false, false, false)
 
     // drag state (follow-the-finger tab pager)
     private var dragActive = false
@@ -171,7 +171,8 @@ class MainActivity : ComponentActivity() {
             2 -> NotificationView(this).also { notificationView = it }
             3 -> CallView(this).also { callView = it }
             4 -> VoipView(this).also { voipView = it }
-            else -> AlarmView(this).also { alarmView = it }
+            5 -> AlarmView(this).also { alarmView = it }
+            else -> PriorityView(this).also { priorityView = it }
         }
         container.addView(v, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT
@@ -193,7 +194,8 @@ class MainActivity : ComponentActivity() {
         2 -> notificationView!!
         3 -> callView!!
         4 -> voipView!!
-        else -> alarmView!!
+        5 -> alarmView!!
+        else -> priorityView!!
     }
 
     /** Lay the current and target pages out for a drag. */

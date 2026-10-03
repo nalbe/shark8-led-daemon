@@ -16,10 +16,11 @@ rem  awctl is NOT rebuilt here: the binary in module\ comes prebuilt
 rem  from the standalone aw2033-driver repo (sources + build there;
 rem  this project ships it as-is).
 rem
-rem  Override the compiler with:   set NDK_CC=path\to\clang.cmd
+rem  Compiler: set NDK_CC to your NDK clang wrapper before running
+rem  (build.cmd errors out on an unset NDK_CC too). Nothing is
+rem  hardcoded here - a machine-local NDK path is not portable.
 rem ============================================================
 setlocal
-if not defined NDK_CC set "NDK_CC=D:\System\Apps\Android NDK\android-ndk-r27d\toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android29-clang.cmd"
 
 set "ROOT=%~dp0"
 set "CORE=%ROOT%led_hal_root"
@@ -53,14 +54,7 @@ if errorlevel 1 exit /b 1
 echo [3/3] Packaging release\led_hal_root-v%VER%.zip...
 if not exist "%ROOT%release" mkdir "%ROOT%release"
 if exist "%ROOT%release\led_hal_root-v%VER%.zip" del /q "%ROOT%release\led_hal_root-v%VER%.zip"
-rem ZipFile::CreateFromDirectory on .NET Framework writes the WINDOWS
-rem separator into every entry name, so "mods\alarm.c" and
-rem "META-INF\com\google\android\update-binary" land on the device as
-rem single files whose names contain a literal backslash. A module
-rem installed that way silently loses parts of itself (ksud reports
-rem chown: ... No such file or directory and the daemon never gets
-rem replaced). Build the archive by hand with '/' in every entry name -
-rem the zip format requires '/', a backslash is not a path separator.
+rem Zip entry names must use '/', so the archive is built entry by entry.
 powershell -NoProfile -Command ^
   "Add-Type -AssemblyName System.IO.Compression;" ^
   "Add-Type -AssemblyName System.IO.Compression.FileSystem;" ^

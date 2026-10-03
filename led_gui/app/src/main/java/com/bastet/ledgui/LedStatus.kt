@@ -11,16 +11,15 @@ import java.util.Locale
  *
  * engine tells how the LED is ACTUALLY driven, which decides whether a
  * raw /sys/class/leds brightness read shows what the eye sees:
- *   breath chip-driven breathing/flash pulse (v3) - the driver pulses
+ *   breath chip-driven breathing/flash pulse - the driver pulses
  *          the channel by itself, brightness node just holds the peak -
  *          "live" reads are useless, the LED is visibly blinking
  *   wave   chip traveling-wave pattern (phase-staggered breathing); the
  *          brightness node holds the base color
  *   solid  static brightness (live read == the shown color)
  *   off    all dark
- *   hw     legacy daemon mapping for chip patterns
  * The GUI hides the misleading live value and shows a hint instead when
- * engine == hw or breath.
+ * engine == breath or wave.
  */
 data class LedStatus(
     val ts: Long = 0,
@@ -30,10 +29,6 @@ data class LedStatus(
     val color: Triple<Int, Int, Int> = Triple(0, 0, 0),
     val engine: String = ""
 ) {
-    val colorHex: String
-        get() = String.format(Locale.US, "#%02X%02X%02X",
-            color.first, color.second, color.third)
-
     val prettyTime: String
         get() = if (ts > 0) {
             SimpleDateFormat("HH:mm:ss", Locale.US).format(Date(ts * 1000))
@@ -48,8 +43,6 @@ data class LedStatus(
 }
 
 object LedStatusReader {
-
-    private const val STATUS_PATH = "/data/local/tmp/led_status"
 
     /** Parse the daemon's led_status key=value dump (no shell roundtrip). */
     internal fun parseStatus(text: String): LedStatus {

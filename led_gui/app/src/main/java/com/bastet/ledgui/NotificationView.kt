@@ -12,34 +12,32 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 
-/** Notification tab, split in two sub-pages like before:
+/** Notification tab, split in two sub-pages:
  *
  *  "default" = the shared preset: notifications WITHOUT a per-app rule
- *  (own color, cap, renderer) plus the shared pending window.
+ *  (own color, cap, renderer) plus the shared basin window.
  *
  *  "app" = per-app rules: apps WITH a rule entry. Each rule owns its
  *  color (pkg=r,g,b) plus its OWN full preset (cap, renderer),
  *  serialized as the extended [rules] line. The list shows the classic
  *  color swatch + package name + delete button; tapping a row opens the
  *  full per-app editor (color, cap, renderer). New rules are seeded from
- *  the default preset. The pending window is NOT per-app: one shared
- *  [notify] value edited in the "Pending window" card.
+ *  the default preset. The basin window is NOT per-app: one shared
+ *  [notify] value edited in the "Basin window" card.
  *
  *  Suppressed apps stay a plain list. Rules and suppressed apps are
  *  edited through an app picker (no free text); each list lives in a
  *  fixed-height internal-scroll box. Rule swatches preview through that
  *  rule's OWN renderer (cur + sync), like the Status live swatch.
  *
- *  Legacy: pre-v5 files used a shared [notify.app] preset for color-only
- * rules. Nothing reads that section any more (the daemon resolves
- * color-only rules to [notify] since v3.7.1), so it is ignored on load
- * and dropped on save; a color-only rule simply shows the default
- * preset, which is what the daemon will apply. */
+*  A [notify.app] preset left in the file by an older format is ignored on
+ *  load and dropped on save; a color-only rule simply shows the default
+ *  preset, which is what the daemon will apply. */
 class NotificationView(context: Context) : ConfPage(context) {
 
-    /** App sub-page rule blocks:
-     *    on 1080x2460: 845 + 64 + 845 = 1754.
-     *  Frame-to-frame gap = 32px + 32px margins. */
+    /** App sub-page rule blocks. Fixed pixel heights so the two cards fit one
+     *  1080x2460 frame without scrolling: 845 + 845 card bodies plus the
+     *  4 * 32px margins = 1754px. */
     private companion object {
         const val APP_CARD_PX_TOP = 845
         const val APP_CARD_PX_BOTTOM = 845
@@ -73,14 +71,14 @@ class NotificationView(context: Context) : ConfPage(context) {
         )
         defaultGroup.addView(defaultKnobs)
         defaultGroup.addView(card {
-            addView(sectionTitle("Pending window (all apps)"))
+            addView(sectionTitle("Basin window (all apps)"))
             addView(spacer(4))
             addView(text(
-                "Shared: while the screen is on, ANY parked notification may hold this long for the screen to turn off before flashing.",
+                "Shared: a notification posted while the screen is on waits in the basin (no timer). When the screen falls, anything older than this is dropped instead of flashing.",
                 12f, parse("#FF727272")
             ))
             addView(spacer(2))
-            nPending = numRow("pending window (ms, screen-off flash)", "60000")
+            nPending = numRow("basin window (ms, age limit at screen off)", "60000")
         })
         body.addView(defaultGroup)
 
@@ -182,9 +180,8 @@ class NotificationView(context: Context) : ConfPage(context) {
     private fun rulePkgs(): Set<String> = localRules.map { it.pkg }.toSet()
     private fun suppressPkgs(): Set<String> = localSuppress.toSet()
 
-    /** New rule: white color, everything else seeded from the CURRENT
-     *  default preset (the settings a rule without its own tail used to
-     *  get before the split). */
+    /** New rule: white color, every other field seeded from the CURRENT
+     *  default preset. */
     private fun addRule(pkg: String) {
         if (localRules.any { it.pkg == pkg }) return
         val r = Render()
@@ -285,11 +282,13 @@ class NotificationView(context: Context) : ConfPage(context) {
      *  same math as the Status live swatch. off = all dark. */
     private fun driveFor(r: Render): Pair<Triple<Int, Int, Int>, Boolean> {
         val sync = (r.mode == "breath" || r.mode == "wave") && r.patternSync
+        // off = all dark. mode is validated against LedConf.VALID_MODES on
+        // parse and by the RenderCard picker, so the else branch only
+        // catches a hand-written value; show nothing rather than guess.
         val cur = when (r.mode) {
             "solid" -> r.solidCur
             "breath", "wave" -> r.patternCur
-            "off" -> Triple(0, 0, 0)
-            else -> Triple(15, 15, 15)
+            else -> Triple(0, 0, 0)
         }
         return Pair(cur, sync)
     }

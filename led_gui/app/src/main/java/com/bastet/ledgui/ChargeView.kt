@@ -24,7 +24,7 @@ class ChargeView(context: Context) : ConfPage(context) {
         body.addView(card {
             addView(sectionTitle("Charge thresholds (percent, order-free)"))
             addView(spacer(4))
-            first = numRow("first threshold", "90")
+            first = numRow("first threshold", "70")
             second = numRow("second threshold", "95")
         })
         bandGroup = LinearLayout(context).apply { orientation = VERTICAL }
@@ -74,8 +74,10 @@ class ChargeView(context: Context) : ConfPage(context) {
     }
 
     override fun collectFrom(c: LedConf) {
-        c.firstThreshold = first.getInt(90)
-        c.secondThreshold = second.getInt(95)
+        // The daemon accepts only 1..100 and drops a bad value, so clamp the same
+        // range here rather than writing a number the daemon would refuse.
+        c.firstThreshold = first.getInt(70).coerceIn(1, 100)
+        c.secondThreshold = second.getInt(95).coerceIn(1, 100)
         cardLow.collect(c.chargeLower)
         cardLow.getColor()?.let { c.lowerColor = it }
         cardMid.collect(c.chargeMiddle)

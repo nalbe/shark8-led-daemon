@@ -1,8 +1,7 @@
-﻿package com.bastet.ledgui
+package com.bastet.ledgui
 
 import android.content.Context
 import android.content.Intent
-import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -29,9 +28,7 @@ import kotlinx.coroutines.withContext
 import java.util.Locale
 import kotlin.math.roundToInt
 
-/** Status tab rebuilt on classic Views (Compose cannot render smooth 120Hz
- * on this firmware; plain View framework does). All logic is identical to
- * the old composable StatusScreen: no Compose anywhere in the render path.
+/** Status tab: root state, daemon + bridge cards, live LED preview, log.
  *
  * Polling: collectAll() every 3s (one persistent-su-shell roundtrip),
  * live LED brightness read 10x/sec, tickers auto-start/stop with the view.
@@ -46,7 +43,7 @@ class StatusView(context: Context) : LinearLayout(context) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var tickerJob: Job? = null
 
-// state
+    // state
     private var rootState = RootState.CHECKING
     private var pid = ""
     private var led: LedStatus = LedStatus()
@@ -78,14 +75,14 @@ class StatusView(context: Context) : LinearLayout(context) {
     private lateinit var loggingCb: CheckBox
     private lateinit var bridgeTv: TextView
 
-init {
+    init {
         orientation = VERTICAL
         setBackgroundColor(parse("#FF121212"))
         buildUi()
         render()
     }
 
-override fun onAttachedToWindow() {
+    override fun onAttachedToWindow() {
         super.onAttachedToWindow()
         if (visibility == VISIBLE) startTicker()
     }
@@ -104,7 +101,7 @@ override fun onAttachedToWindow() {
         if (visibility == VISIBLE) startTicker() else stopTicker()
     }
 
-private fun startTicker() {
+    private fun startTicker() {
         if (tickerJob != null && tickerJob!!.isActive) return
         tickerJob = scope.launch {
             launch { refreshLoop() }
@@ -156,7 +153,7 @@ private fun startTicker() {
         render()
     }
 
-private fun render() {
+    private fun render() {
         renderRoot()
         renderDaemon()
         renderBridge()
@@ -221,7 +218,7 @@ private fun render() {
                 rootTv.setTextColor(parse("#FFE0E0E0"))
                 rootHintTv.text = ""
             }
-RootState.PENDING -> {
+            RootState.PENDING -> {
                 if (suUnreachable) {
                     rootTv.text = "Root request: no su binary reachable"
                     rootHintTv.text = "KernelSU exposes su only to allowlisted apps. " +
@@ -246,7 +243,7 @@ RootState.PENDING -> {
                     "Open KernelSU Manager, tap Superuser, add LED GUI and set Allow."
             }
         }
-requestBtn.isEnabled = rootState != RootState.GRANTED
+    requestBtn.isEnabled = rootState != RootState.GRANTED
         requestBtn.alpha = if (requestBtn.isEnabled) 1f else 0.45f
     }
 
@@ -365,7 +362,7 @@ requestBtn.isEnabled = rootState != RootState.GRANTED
     }
 
     private fun renderLed() {
-if (led.mode.isEmpty()) {
+    if (led.mode.isEmpty()) {
             ledModeTv.text = "no /data/local/tmp/led_status (old daemon binary?)"
             ledColorTv.visibility = GONE
             ledLightBandTv.visibility = GONE
@@ -378,7 +375,7 @@ if (led.mode.isEmpty()) {
         ledLightBandTv.visibility = VISIBLE
         ledPkgTv.visibility = VISIBLE
         ledSinceTv.visibility = VISIBLE
-ledModeTv.text = "mode: ${led.mode}  ${if (led.isArmed) "(armed)" else "(off)"}"
+    ledModeTv.text = "mode: ${led.mode}  ${if (led.isArmed) "(armed)" else "(off)"}"
         ledLightBandTv.text = "band: ${led.band.ifBlank { "-" }}${
             if (led.engine.isBlank()) "" else "  engine: ${led.engine}"
         }"
@@ -387,7 +384,7 @@ ledModeTv.text = "mode: ${led.mode}  ${if (led.isArmed) "(armed)" else "(off)"}"
         updateLedLive()
     }
 
-private fun updateLedLive() {
+    private fun updateLedLive() {
         if (led.mode.isEmpty()) return
         val sw = ledSwatch.background as? GradientDrawable ?: return
         /* Live color coming OUT of the chip is unreadable: the AW2033
@@ -429,9 +426,9 @@ private fun updateLedLive() {
                 "breathing runs on the AW2033 chip (hardware pattern)"
             }
         }
-}
+    }
 
-// ---------------------------------------------------------------- actions
+    // ---------------------------------------------------------------- actions
 
     private fun refreshNow() {
         scope.launch {
@@ -520,10 +517,8 @@ private fun updateLedLive() {
     private fun requestRoot() {
         if (rootRequestPending) return
         rootRequestPending = true
-        // No instant PENDING paint here: on this firmware a hidden su answers
-        // "no root" within milliseconds, so the old optimistic flash looked
-        // like a broken flicker. PENDING is only painted when a real su stood
-        // up and is actually waiting on the manager's dialog.
+        // PENDING is painted only once a real su stood up and is actually
+        // waiting on the manager's dialog.
         scope.launch {
             val r = withContext(Dispatchers.IO) { probeRoot() }
             rootRequestPending = false
@@ -552,7 +547,7 @@ private fun updateLedLive() {
 
     // ---------------------------------------------------------------- UI build
 
-private fun buildUi() {
+    private fun buildUi() {
         val scroll = ScrollView(context)
         scroll.isFillViewport = true
         val content = LinearLayout(context)
@@ -576,7 +571,7 @@ private fun buildUi() {
             }))
         })
 
-// --- Daemon card
+    // --- Daemon card
         content.addView(card {
             addView(sectionTitle("Daemon"))
             addView(spacer(6))
@@ -642,7 +637,7 @@ private fun buildUi() {
             ledSwatch.layoutParams = LayoutParams(dpi(30), dpi(30))
             val liveCol = LinearLayout(context)
             liveCol.orientation = VERTICAL
-ledModeTv = text("")
+    ledModeTv = text("")
             ledColorTv = text("", 13f, parse("#FFB0BEC5"), mono = true)
             ledLightBandTv = text("")
             ledPkgTv = text("")
@@ -705,7 +700,7 @@ ledModeTv = text("")
         })
     }
 
-// ---------------------------------------------------------------- helpers
+    // ---------------------------------------------------------------- helpers
 
     private fun dpf(v: Float) = v * resources.displayMetrics.density
 
@@ -768,23 +763,17 @@ ledModeTv = text("")
         return l
     }
 
-private fun filledBtn(label: String, onClick: () -> Unit): Button {
-        val b = Button(context)
-        b.text = label
-        b.isAllCaps = false
-        b.setTextColor(parse("#FF90CAF9"))
-        b.textSize = 14f
-        val g = GradientDrawable()
-        g.shape = GradientDrawable.RECTANGLE
-        g.cornerRadius = dpf(8)
-        g.setColor(parse("#FF242424"))
-        g.setStroke(dpi(1), parse("#FF5C6BC0"))
-        b.background = g
-        b.setOnClickListener { onClick() }
-        return b
-    }
+/** Filled action button: solid body, used for the primary action of a
+     *  row ("Save to device", "Refresh", the test hooks). */
+    private fun filledBtn(label: String, onClick: () -> Unit): Button =
+        actionBtn(label, onClick, parse("#FF242424"))
 
-    private fun outlinedBtn(label: String, onClick: () -> Unit): Button {
+    /** Outlined action button: transparent body, the secondary action next
+     *  to a filled one ("Reload", "Restart", "Open"). */
+    private fun outlinedBtn(label: String, onClick: () -> Unit): Button =
+        actionBtn(label, onClick, parse("#00000000"))
+
+    private fun actionBtn(label: String, onClick: () -> Unit, fill: Int): Button {
         val b = Button(context)
         b.text = label
         b.isAllCaps = false
@@ -793,7 +782,7 @@ private fun filledBtn(label: String, onClick: () -> Unit): Button {
         val g = GradientDrawable()
         g.shape = GradientDrawable.RECTANGLE
         g.cornerRadius = dpf(8)
-        g.setColor(parse("#FF242424"))
+        g.setColor(fill)
         g.setStroke(dpi(1), parse("#FF5C6BC0"))
         b.background = g
         b.setOnClickListener { onClick() }
@@ -801,8 +790,6 @@ private fun filledBtn(label: String, onClick: () -> Unit): Button {
     }
 
     // ---------------------------------------------------------------- shell glue
-
-private fun daemonPid(): String = Su.run("pidof chgd 2>/dev/null").out
 
     /** One snapshot of everything the Status screen shows in ONE su call. */
     private data class Snapshot(

@@ -1,8 +1,8 @@
 /*
  * util.c - logging, file read helper, live status files, screen state
  * cache. Pure device plumbing; no policy here. Shared by the core and
- * mods. All LED-channel writes live in led.c, not here. No sysfs access:
- * every hardware fact (screen, charge, notifications) comes from the
+ * mods. All LED-channel writes live in led.c, not here.
+ * Every hardware fact (screen, charge, notifications) comes from the
  * bridge's NLS events.
  */
 
@@ -12,7 +12,6 @@
 #include <stdarg.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <errno.h>
 #include <time.h>
 #include "chgd.h"
 
@@ -20,10 +19,10 @@ int g_verbose = 0;
 
 /* Runtime logging switch, driven by [led] logging in led.conf (config.c
  * calls log_set_enabled() every time the config is (re)loaded). When off,
- * log_line() becomes a pure no-op: no file write, no reload probing. The
- * switch is re-read by the core on SIGALRM / inotify (led.conf edited),
- * never per log line. The GUI's ledd.log (tail) card just shows whatever
- * was written before the switch left. */
+ * the routine event trace stops; a "warn: " line is still written. The
+ * switch is re-read by the core on SIGALRM / inotify (led.conf edited).
+ * The GUI's ledd.log (tail) card just shows whatever was written before
+ * the switch left. */
 static int g_log_allow = 1;
 
 void log_set_enabled(int on)
@@ -31,15 +30,20 @@ void log_set_enabled(int on)
     g_log_allow = on ? 1 : 0;
 }
 
-/* shared tail of log_line()/log_warn(): timestamp + append + size cap.
- * force = 1 writes even when the [led] logging switch is off. */
-static void log_emit(const char *msg, int force)
+/* The ONE logging path: timestamp + append + size cap. Every diagnostic in
+ * the daemon goes through here, and a warning is a message that starts with
+ * "warn: ", which keeps it separable from the routine trace by a plain grep
+ * in the same file. */
+static void log_emit(const char *msg)
 {
     if (g_verbose) {
         fprintf(stderr, "%s\n", msg);
         return;
     }
-    if (!g_log_allow && !force) return;
+    /* A warning names a key or a wire that does not work: it is written
+     * whatever [led] logging says, so switching the trace off must not hide
+     * the very thing that needs fixing. */
+    if (!g_log_allow && strncmp(msg, "warn: ", 6) != 0) return;
     FILE *n = fopen("/data/local/tmp/ledd.log", "a");
     if (!n) return;
     long sz = ftell(n);
@@ -69,6 +73,9 @@ static void log_emit(const char *msg, int force)
     fclose(n);
 }
 
+/* The single logging entry point of the daemon. Controlled by the
+ * [led] logging key in led.conf; every caller spells out a "warn: "
+ * prefix when the line is a warning. */
 void log_line(const char *fmt, ...)
 {
     char msg[512];
@@ -76,21 +83,7 @@ void log_line(const char *fmt, ...)
     va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
-    log_emit(msg, 0);
-}
-
-/* prefix every warning with "warn:" so a single grep separates real
- * config problems from the routine event trace. Bypasses g_log_allow. */
-void log_warn(const char *fmt, ...)
-{
-    char msg[512];
-    char out[544];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(msg, sizeof(msg), fmt, ap);
-    va_end(ap);
-    snprintf(out, sizeof(out), "warn: %s", msg);
-    log_emit(out, 1);
+    log_emit(msg);
 }
 
 /* ---------------- file read / atomic write helpers ---------------- */
@@ -110,7 +103,7 @@ int read_line(const char *path, char *out, size_t n)
 
 /* Atomic text write: full write to <path>.tmp then rename over <path>,
  * so a consumer read can never observe a half-written file. Every status
- * file in the daemon (led_status, notifybridge.status, led_chg) uses
+ * file in the daemon (led_status, notifybridge.status) uses
  * this single helper - the classic write-tmp+rename pattern. */
 void atomic_write(const char *path, const char *buf, size_t len)
 {
@@ -129,16 +122,16 @@ void atomic_write(const char *path, const char *buf, size_t len)
  * Settings.System NOTIFICATION_LIGHT_PULSE (Settings -> Notifications).
  * Only the NOTIFICATION LEDs honour it - charge bands, call rainbows
  * and the alarm are separate "whatever signals", so they must NOT be
- * gated here. Gate points: arm_notification_ex() (mods/notify.c) for the
- * generic notification pool and missed_on() (mods/missed.c) for the
- * missed-call tombstone - the bridge emits it as a notification and the
- * stock toggle must kill it like any other notification LED.
+ * gated here. The gate points are the KINDS themselves: notify and
+ * missed declare EV_PULSE_GATED (the pool drops exactly those entries
+ * on a PULSE 0 event), so the mod code has no gate logic in it and the
+ * core's PULSE 0 event releases exactly what declared it. The
+ * bridge emits the missed tombstone as a notification and the stock
+ * toggle must kill it like any other notification LED.
  *
- * State comes ONLY from the bridge's NLS "PULSE <0|1>" event: the
- * notify-bridge watches the settings key with a ContentObserver and
- * forwards every real change; on socket connect it replays the current
- * value (same contract as SCREEN), so the daemon reads no settings and
- * forks no shell for this. Unknown before the first event = on
+ * State comes ONLY from the bridge's NLS "PULSE <0|1>" event. On socket
+ * connect it replays the current value (same contract as SCREEN).
+ * Unknown before the first event = on
  * (Android's default), so a hiccup never silently eats notifications. */
 
 static int s_pulse = 1;     /* 0 = toggle off, 1 = on (default until told) */
@@ -177,13 +170,12 @@ void nls_status_write(int connected)
  * pkg:  armed notification / ring / voip pseudo-package, "" when none
  * engine: how the LED is actually driven - tells a consumer whether the
  *   raw /sys/class/leds brightness value reflects what the eye sees:
- *     hw     hardware blink/breath/blink on the AW2033: the brightness
- *            node reads the constant peak while the chip pulses - live
- *            reads are NOT representative
+ *     breath  chip-driven breathing: the brightness node reads the constant
+ *            peak while the chip pulses - live reads are NOT representative
  *     wave   traveling wave on the chip: same, live reads not live
  *     solid  static brightness: fixed value, live read == the color
  *     off    all channels dark
- * Atomic write via atomic_write() (tmp + rename), same as led_chg. */
+ * Atomic write via atomic_write() (tmp + rename). */
 void status_write(const char *mode, const char *band, const char *pkg,
                   int r, int g, int b, const char *engine)
 {
@@ -197,19 +189,16 @@ void status_write(const char *mode, const char *band, const char *pkg,
 
 /* ---------------- screen state ---------------- */
 
-/* Screen state cache, fed ONLY by the bridge's NLS "SCREEN <0|1>" event
- * (the daemon reads no sysfs and owns no screen polling - the notify-
- * bridge registers ACTION_SCREEN_ON/OFF and replays the current polarity
- * on socket connect, so the first event arrives right after the client
- * connects). A park flashes the instant SCREEN 0 lands; there is no 1s
- * poll anywhere in this path. On bridge disconnect the last known value
- * simply stays - with the bridge down nothing can feed the notification
- * pool anyway, and the reconnect replay refreshes the state. */
+/* Screen state cache, fed by the bridge's NLS "SCREEN <0|1>" event
+ * - the notify-bridge registers ACTION_SCREEN_ON/OFF and replays the
+ * current polarity on socket connect, so the first event arrives right
+ * after the client connects. A park flashes the instant SCREEN 0 lands.
+ * On bridge disconnect the last known value stays until the reconnect
+ * replay refreshes it. */
 static int s_screen = 0;    /* 0 off, 1 on; unknown before the first SCREEN */
 
 /* returns 1 = screen on, 0 = off (unknown before the first SCREEN event
- * reports off -> a notification shows, matching the pre-hardcode
- * behavior). */
+ * reports off -> a notification shows). */
 int screen_on(void)
 {
     return s_screen;

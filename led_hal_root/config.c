@@ -1,40 +1,47 @@
 /*
  * config.c - runtime INI config for the LED policies.
  *
- * Reads /data/adb/modules/led_hal_root/led.conf at runtime and merges it
- * over the link-time registry (internal pseudo-packages only, e.g.
- * missed.call) so the user can tweak blacklists / colours / timings
- * WITHOUT recompiling.
+ * Reads /data/adb/modules/led_hal_root/led.conf at runtime.
+ *
+ * LINE SYNTAX: '#' or ';' opens a comment - a line of its own or right
+ * after a setting. A value whose last character is a comma continues on
+ * the next line (a trailing backslash does the same), so a long preset
+ * can be spread over several lines with a comment on every one of them;
+ * the trimmed fragments are joined and parsed as a single line.
  *
  * SECTIONS:
  *   [suppress]  one package per line - never lights the LED
- *   [rules]     pkg=r,g,b[,...]  (0-255 per channel). The optional comma
- *               tail carries that app's OWN notify preset (cap, pending
- *               window, renderer mode, chip knobs) and is synthesized into
- *               a [notify.<pkg>] section at load. Without the tail the app
+ *   [rules]     pkg=r,g,b,cap,<preset fields>  (0-255 per channel). The
+ *               optional comma tail carries that app's OWN notify preset
+ *               (cap + preset line fields) and is synthesized into a
+ *               [notify.<pkg>] section at load. Without the tail the app
  *               uses the shared [notify] preset.
  *   [charge]    first_threshold / second_threshold (%) ONLY - each band
- *               owns its renderer: [charge.lower|middle|upper] mode=
- *               color= plus the [charge.<band>.solid/pattern] chip
- *               sections (timing = chip-owned)
+ *               owns its own section: [charge.lower|middle|upper] carries
+ *               its own render= line, colour included
  *   [notify]    behavior for apps WITHOUT a [rules] entry:
- *               notif_max_sec (0 = unlimited), default_color r,g,b,
- *               notify_screen_delay_ms + renderer mode/chip sections
- *   [notify.app]  legacy shared preset from pre-v5 files (color-only
- *               rules). Still parsed so old files load, but nothing
- *               resolves to it since v3.7.1: a color-only rule now uses
- *               [notify], the section the v5 template actually writes.
- *   [ring]      incoming-call rainbow: max_sec + v3 color
- *   [voip]      messenger-call rainbow: max_sec + v3 color
+ *               max_sec (0 = unlimited), notify_screen_delay_ms and
+ *               the render= line whose colour triple IS the shared default
+ *               colour
+ *   [ring] / [voip]      call rainbows: max_sec + render
+ *   [missed] / [alarm]    tombstone / clock: max_sec + render
+ *   [priority]  channel ranking, one key per effect (ring, voip, alarm,
+ *               missed, notify, charge), BIGGER WINS. Read by channel.c
+ *               through the generic kv table. Every key is required:
+ *               an effect with no rank cannot be arbitrated and
+ *               is dropped (logged) instead.
+ *   [led]       chip/daemon globals only: logging, imax
  *
- * v5 per-event renderer sections (owned by led.c through the generic kv
- * table, one per event sec = charge|notify|missed|alarm|ring|voip):
- *   [sec]          mode=off|solid|breath|wave
- *   [sec.solid]    cur=r,g,b (0..15)
- *   [sec.pattern]  repeat, cur_r/cur_g/cur_b, rise/hold/fall/offt, sync,
- *                  t0=r,g,b (wave only)
- * Legacy [sec.breath]/[sec.wave] sections are accepted by the daemon.
- *   [led]          chip/daemon globals only: logging, imax
+ * THE PRESET LINE - one key, render=, carries a whole renderer:
+ *   render=<r,g,b>,<mode>,<cur_r,g,b>,pattern,<sync>,<repeat>,
+ *          <cur_r,g,b>,<rise>,<hold>,<fall>,<offt>,<t0_r,g,b>
+ *          colour triple + 17 fields = 20 comma tokens
+ * A [rules] tail is those same 17 fields after its own cap, without the
+ * colour - the rules line already carried it. The budget is never in the
+ * line: max_sec stays a named key the owning mod reads.
+ * render_synth() expands the line into the keys led.c reads ([sec] mode,
+ * [sec.solid] cur, [sec.pattern] the rest), so led.c and the mods only
+ * ever see one flat key per field.
  *
  * Every other key=value pair anywhere in the file lands in a generic
  * key-value table (conf_get_str / conf_get_int). That is how mods own
@@ -44,18 +51,16 @@
  * The file is reloaded lazily: every lookup calls conf_maybe_reload(),
  * which normally just consumes an inotify flag set by the core when the
  * directory holding led.conf changed (see conf_watch_init/conf_watch_handle).
- * No I/O happens in the steady loop unless the file was actually edited;
- * a stat()-based probe survives only as a fallback for when inotify is
- * unavailable.
+ * A stat()-based probe covers the case when inotify is unavailable.
  *
  * Registry merge rules:
- *   - suppress list = file [suppress] entries ONLY (runtime; no link-time
- *     blacklist anymore - suppress.c was removed)
- *   - rules        = file [rules] entries override the link-time registry,
- *     which carries ONLY internal pseudo-packages (missed.call)
- *   - charge/notify colours come from the file, falling back to builtins
+ *   - suppress list = file [suppress] entries ONLY (runtime)
+ *   - rules         = file [rules] entries ONLY
+ *   - Every colour, threshold, cap and window this daemon paints is
+ *     read from the file. A key the file does not define has no value
+ *     to invent: the read fails, the caller drops the event,
+ *     and conf_req_* plus the log name the key that is missing.
  *
- * All config text and this file are ASCII-only (no non-ASCII in artifacts).
  */
 
 #include <stdio.h>
@@ -75,20 +80,16 @@
 #define MAX_RULES 96
 
 /* generic key-value store for mod-owned sections (e.g. [ring],
- * [charge.solid], [charge.pattern], ...) plus the synthetic
+ * [charge.lower], ...) plus the chip sections render_synth() builds out of
+ * a preset line ([<sec>.solid], [<sec>.pattern]) and the synthetic
  * per-rule [notify.<pkg>] presets. sec holds long section names
  * ("notify.<very.long.pkg>.pattern"), val holds long [rules] values. */
 #define MAX_KV   2560
 struct kv { char sec[128]; char key[32]; char val[192]; };
 
-/* builtin fallbacks */
-#define DEF_FIRST_AT 90
-#define DEF_SECOND_AT 95
-#define DEF_NOTIF_MAX 1800
-/* builtin notify default: breathing white */
-#define DEF_NTF_R 255
-#define DEF_NTF_G 255
-#define DEF_NTF_B 255
+/* Absence markers: -1 (or the g_ntf_set flag) means "the file did not
+ * define the key", and every reader turns that into a drop. */
+#define ABSENT (-1)
 
 static char    g_supp[MAX_SUPP][96];
 static int     g_nsupp = 0;
@@ -97,12 +98,22 @@ static int     g_nrules = 0;
 static struct kv g_kv[MAX_KV];
 static int     g_nkv = 0;
 
-static int  g_first_at = DEF_FIRST_AT;
-static int  g_second_at = DEF_SECOND_AT;
-static int  g_ntf_r = DEF_NTF_R, g_ntf_g = DEF_NTF_G, g_ntf_b = DEF_NTF_B;
-static long g_notif_max = DEF_NOTIF_MAX;
+static int  g_first_at = ABSENT;
+static int  g_second_at = ABSENT;
+static int  g_ntf_r = 0, g_ntf_g = 0, g_ntf_b = 0;
+static int  g_ntf_set = 0;
 
 static time_t g_last_mtime = 0;
+
+/* Bumped every time the file-owned state is emptied (reset_dynamic), so a
+ * cache built from the old file knows it is stale. The pool stamps the
+ * ranks and budgets it caches with this value. */
+static unsigned g_generation = 0;
+
+unsigned conf_generation(void)
+{
+    return g_generation;
+}
 
 /* [led] logging: runtime switch for the on-disk log. Applied to the
  * logger via log_set_enabled() on every config (re)load so the GUI can
@@ -114,6 +125,13 @@ static int g_logging = 1;
  * number the moment a GUI/daemon version mismatch is in play. */
 static int g_nbroken = 0;
 
+/* Required-key warnings are logged once per (sec,key), not once per
+ * event. Cleared on every reload so a key that is fixed and then
+ * broken again speaks up again. Single-threaded, tiny table. */
+#define MAX_REQWARN 24
+static char g_reqwarn[MAX_REQWARN][160];
+static int  g_nreqwarn = 0;
+
 /* ---------------- helpers ---------------- */
 
 static void trim(char *s)
@@ -123,6 +141,36 @@ static void trim(char *s)
     if (p != s) memmove(s, p, strlen(p) + 1);
     size_t l = strlen(s);
     while (l && isspace((unsigned char)s[l - 1])) s[--l] = '\0';
+}
+
+/* Cut a physical line at the first comment marker: a comment may follow a
+ * setting on the very same line, not only occupy a line of its own. */
+static void strip_comment(char *s)
+{
+    for (char *p = s; *p; p++)
+        if (*p == '#' || *p == ';') { *p = '\0'; return; }
+}
+
+/* A value that ends in a comma continues on the next line, so a preset can
+ * be spread out with a comment on every one of its lines; a trailing
+ * backslash says the same thing and is cut off here. */
+static int cut_continuation(char *s)
+{
+    trim(s);
+    size_t l = strlen(s);
+    if (!l) return 0;
+    if (s[l - 1] == '\\') { s[l - 1] = '\0'; trim(s); return 1; }
+    return s[l - 1] == ',';
+}
+
+/* append one fragment to the logical line being assembled; 0 = it no longer
+ * fits, and the whole logical line is dropped */
+static int line_append(char *dst, size_t cap, const char *src)
+{
+    size_t have = strlen(dst), add = strlen(src);
+    if (have + add + 1 > cap) return 0;
+    memcpy(dst + have, src, add + 1);
+    return 1;
 }
 
 static int in_supp(const char *pkg)
@@ -152,47 +200,36 @@ static int parse_rgb(const char *val, int *r, int *g, int *b)
     return 1;
 }
 
-/* ---------------- registry seeding ---------------- */
-
-/* terminator keeps the link-time chgd_rules section non-empty so
- * __start/__stop stay defined even with zero built-in rules; consumers
- * stop at .pkg == NULL. No hidden rule is defined at build time - every
- * real color must come from led.conf [rules]. */
-static const struct led_rule chgd_rules_terminator
-    __attribute__((used, section("chgd_rules"))) = { NULL, 0, 0, 0 };
-
-/* seed the rule table from the link-time registry (extension point for
- * future built-ins, currently only the terminator). Real app colors come
- * from led.conf [rules] and win over any built-in. */
-static void seed_rules(void)
+/* parse a whole-string decimal int; returns 1 on success. strtol alone is
+ * not enough: it happily reads "90%" or "12abc" and the daemon would
+ * paint a value the file never actually said. */
+static int parse_int(const char *val, long *out)
 {
-    const struct led_rule *r;
-    int rr = 0, gg = 0, bb = 0;
-    for (r = __start_chgd_rules; r->pkg; r++) {
-        if (g_nrules >= MAX_RULES) break;
-        if (rule_rgb(r->pkg, &rr, &gg, &bb) == 0) {
-            snprintf(g_rules[g_nrules].pkg, sizeof(g_rules[0].pkg), "%s", r->pkg);
-            g_rules[g_nrules].r = r->r;
-            g_rules[g_nrules].g = r->g;
-            g_rules[g_nrules].b = r->b;
-            g_nrules++;
-        }
-    }
+    char *end = NULL;
+    long v = strtol(val, &end, 10);
+    if (end == val) return 0;
+    while (*end && isspace((unsigned char)*end)) end++;
+    if (*end) return 0;
+    *out = v;
+    return 1;
 }
 
-/* ---------------- ---------------- */
+/* ---------------- reset to absence ---------------- */
 
+/* Empty every file-owned table and put every owned value back into the
+ * "the file did not define this" state. */
 static void reset_dynamic(void)
 {
+    g_generation++;
     g_nsupp = 0;
     g_nrules = 0;
     g_nkv = 0;
     g_nbroken = 0;
-    seed_rules();
-    g_first_at = DEF_FIRST_AT;
-    g_second_at = DEF_SECOND_AT;
-    g_ntf_r = DEF_NTF_R; g_ntf_g = DEF_NTF_G; g_ntf_b = DEF_NTF_B;
-    g_notif_max = DEF_NOTIF_MAX;
+    g_nreqwarn = 0;
+    g_first_at = ABSENT;
+    g_second_at = ABSENT;
+    g_ntf_r = 0; g_ntf_g = 0; g_ntf_b = 0;
+    g_ntf_set = 0;
     g_logging = 1;
     log_set_enabled(1);
 }
@@ -208,7 +245,7 @@ static void kv_put(const char *sec, const char *key, const char *val)
         }
     }
     if (g_nkv >= MAX_KV) {
-        LOGW("[conf] kv table full (%d), dropped [%s] %s", MAX_KV, sec, key);
+        LOGI("warn: [conf] kv table full (%d), dropped [%s] %s", MAX_KV, sec, key);
         return;
     }
     snprintf(g_kv[g_nkv].sec, sizeof(g_kv[g_nkv].sec), "%s", sec);
@@ -217,7 +254,7 @@ static void kv_put(const char *sec, const char *key, const char *val)
     g_nkv++;
 }
 
-/* internal kv-table probe (no reload guard - callers reload first) */
+/* internal kv-table probe (no reload guard) */
 static int kv_has_sec(const char *sec)
 {
     for (int i = 0; i < g_nkv; i++)
@@ -245,208 +282,211 @@ static void kvi(const char *sec, const char *key, long v)
     kv_put(sec, key, buf);
 }
 
-/* ---------------- extended [rules] presets ---------------- */
-
-/* Pull one leading int token (comma-terminated) out of the tail cursor.
- * The cursor advances only on success - the token stream is left-prefix,
- * so the FIRST broken token stops the whole tail. */
-static int tok_int(const char **p, long *out)
+/* triple kv setter for the synthesized preset */
+static void kvt(const char *sec, const char *key, const long v[3])
 {
-    const char *s = *p;
-    if (!s) return 0;
-    char *end = NULL;
-    long v = strtol(s, &end, 10);
-    if (end == s) return 0;                /* no int at the head         */
-    *out = v;
-    *p = (*end == ',') ? end + 1 : NULL;   /* consumed; NULL = tail done */
-    return 1;
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%ld,%ld,%ld", v[0], v[1], v[2]);
+    kv_put(sec, key, buf);
 }
 
-static int tok_literal(const char **p, const char *want)
+/* ---------------- the preset line ----------------
+ *
+ * render=<r,g,b>,<mode>,<cur_r,g,b>,pattern,<sync>,<repeat>,
+ *        <cur_r,g,b>,<rise>,<hold>,<fall>,<offt>,<t0_r,g,b>
+ *
+ * A [rules] tail is the same line after its own cap, minus the colour -
+ * the rules line already carries it. Both are read here and expanded into
+ * the flat keys led.c asks for, so there is exactly one parser for the
+ * whole renderer vocabulary no matter which kind of line it arrived in. */
+
+static const char *const g_rfield[] = {
+    "mode", "cur", "cur", "cur", "pattern", "sync", "repeat",
+    "cur_r", "cur_g", "cur_b", "rise", "hold", "fall", "offt",
+    "t0_r", "t0_g", "t0_b"
+};
+#define RN_FIELDS ((int)(sizeof(g_rfield) / sizeof(g_rfield[0])))
+
+/* one token of a preset line, cursor advanced past it. The cursor is only
+ * advanced when the token really is there, so a short line stops on the
+ * first field it does not have instead of reading past the end. */
+static int rtok(const char *where, const char **p, const char *field,
+                char *buf, size_t n)
 {
     const char *s = *p;
-    if (!s) return 0;
+    if (!s) {
+        LOGI("warn: [conf] %s: line ends before %s", where, field);
+        return 0;
+    }
     const char *end = strchr(s, ',');
-    size_t n = end ? (size_t)(end - s) : strlen(s);
-    if (strlen(want) != n || strncmp(s, want, n)) return 0;
+    size_t len = end ? (size_t)(end - s) : strlen(s);
+    if (len >= n) len = n - 1;
+    memcpy(buf, s, len);
+    buf[len] = '\0';
+    trim(buf);
     *p = end ? end + 1 : NULL;
     return 1;
 }
 
-static int tail_tokens(const char *p)
+/* a numeric preset field: strtol alone would read "500ms" as 500 and paint
+ * a timing the file never said. */
+static int rnum(const char *where, const char **p, const char *field, long *out)
 {
-    int n = 0;
-    while (p && *p) {
-        const char *end = strchr(p, ',');
-        n++;
-        if (!end) break;
-        p = end + 1;
+    char buf[32];
+    if (!rtok(where, p, field, buf, sizeof(buf))) return 0;
+    char *end = NULL;
+    long v = strtol(buf, &end, 10);
+    if (end == buf || *end) {
+        LOGI("warn: [conf] %s: %s=\"%s\" is not a number", where, field, buf);
+        return 0;
     }
-    return n;
+    *out = v;
+    return 1;
 }
 
-/* mode word ("off"|"solid"|"breath"|"wave"), same left-prefix cursor */
-static int tok_mode(const char **p, char out[8])
+/* a literal preset field ("pattern") */
+static int rword(const char *where, const char **p, const char *field,
+                 const char *want)
 {
-    const char *s = *p;
-    if (!s) return 0;
-    const char *end = strchr(s, ',');
-    size_t n = end ? (size_t)(end - s) : strlen(s);
-    static const char *modes[] = { "off", "solid", "breath", "wave" };
-    for (size_t i = 0; i < 4; i++)
-        if (strlen(modes[i]) == n && !strncmp(s, modes[i], n)) {
-            strcpy(out, modes[i]);
-            *p = end ? end + 1 : NULL;
-            return 1;
-        }
-    return 0;
+    char buf[16];
+    if (!rtok(where, p, field, buf, sizeof(buf))) return 0;
+    if (strcmp(buf, want)) {
+        LOGI("warn: [conf] %s: %s=\"%s\", want \"%s\"", where, field, buf, want);
+        return 0;
+    }
+    return 1;
 }
 
-/* The extended tail is  r,g,b, cap, mode, solid_cur, pattern, ...
- * New custom rules use one shared pattern preset for breath and wave:
- *   [notify.<pkg>]          notif_max_sec / mode
- *   [notify.<pkg>.solid]    cur=r,g,b
- *   [notify.<pkg>.pattern]  sync, repeat, cur_r/g/b, rise, hold, fall, offt,
- *                           t0=r,g,b
- * The old positional breath/wave tail is accepted for migration and keeps
- * its two legacy sections so existing behavior is not lost until the GUI
- * rewrites the file. */
-static void rule_synth(const char *pkg, const char *tail)
+/* split "r,g,b,<rest>" into the colour triple and a cursor at <rest> */
+static int split_color(const char *val, char col[64], const char **tail)
 {
-    const char *p = tail;
-    long v;
-    long cap = -1;
+    const char *p = val;
+    for (int i = 0; i < 3; i++) {
+        const char *c = strchr(p, ',');
+        if (!c) return 0;
+        p = c + 1;
+        if (i == 2) *tail = p;
+    }
+    size_t n = (size_t)(p - val) - 1;
+    if (n >= 64) n = 63;
+    memcpy(col, val, n);
+    col[n] = '\0';
+    return 1;
+}
+
+/* Expand one preset line into [sec] mode, [sec.solid] cur and
+ * [sec.pattern] the timing. The cursor starts at the first field AFTER the
+ * colour and must be empty at the end: all 17 fields or nothing, so a
+ * broken line leaves the section empty and the event dark rather than
+ * painting half a preset. Values are stored verbatim - their legal ranges
+ * are led.c's business, which reports them by key like any other. */
+static int render_synth(const char *where, const char *sec, const char **p)
+{
+    char s[sizeof(g_kv[0].sec)];
     char mode[8] = "";
-    long scur[3] = { -1, -1, -1 };
-    long psync = -1, prep = -1, pcur[3] = { -1, -1, -1 };
-    long prise = -1, phold = -1, pfall = -1, pofft = -1;
-    long pt0[3] = { -1, -1, -1 };
-    long bsync = -1, brep = -1, bcur[3] = { -1, -1, -1 };
-    long brise = -1, bhold = -1, bfall = -1, bofft = -1;
-    long wsync = -1, wt0[3] = { -1, -1, -1 }, wrep = -1;
-    long wrise = -1, whold = -1, wfall = -1, wofft = -1;
-    int shared = 0;
+    long sync, rep, scur[3], pcur[3], tt[4], pt0[3];
 
-    if (tok_int(&p, &v)) cap = v;
-    tok_mode(&p, mode);
-    for (int i = 0; i < 3 && tok_int(&p, &v); i++) scur[i] = v;
-
-    if (tok_literal(&p, "pattern") || tail_tokens(p) == 12) {
-        shared = 1;
-        if (tok_int(&p, &v)) psync = v;
-        if (tok_int(&p, &v)) prep = v;
-        for (int i = 0; i < 3 && tok_int(&p, &v); i++) pcur[i] = v;
-        if (tok_int(&p, &v)) prise = v;
-        if (tok_int(&p, &v)) phold = v;
-        if (tok_int(&p, &v)) pfall = v;
-        if (tok_int(&p, &v)) pofft = v;
-        for (int i = 0; i < 3 && tok_int(&p, &v); i++) pt0[i] = v;
-    } else {
-        if (tok_int(&p, &v)) bsync = v;
-        if (tok_int(&p, &v)) brep = v;
-        for (int i = 0; i < 3 && tok_int(&p, &v); i++) bcur[i] = v;
-        if (tok_int(&p, &v)) brise = v;
-        if (tok_int(&p, &v)) bhold = v;
-        if (tok_int(&p, &v)) bfall = v;
-        if (tok_int(&p, &v)) bofft = v;
-        if (tok_int(&p, &v)) wsync = v;
-        for (int i = 0; i < 3 && tok_int(&p, &v); i++) wt0[i] = v;
-        if (tok_int(&p, &v)) wrep = v;
-        if (tok_int(&p, &v)) wrise = v;
-        if (tok_int(&p, &v)) whold = v;
-        if (tok_int(&p, &v)) wfall = v;
-        if (tok_int(&p, &v)) wofft = v;
+    {
+        char buf[16];
+        if (!rtok(where, p, g_rfield[0], buf, sizeof(buf))) return 0;
+        if (strcmp(buf, "off") && strcmp(buf, "solid") &&
+            strcmp(buf, "breath") && strcmp(buf, "wave")) {
+            LOGI("warn: [conf] %s: mode=\"%s\", want off|solid|breath|wave",
+                 where, buf);
+            return 0;
+        }
+        snprintf(mode, sizeof(mode), "%s", buf);
+    }
+    for (int i = 0; i < 3; i++)
+        if (!rnum(where, p, g_rfield[1 + i], &scur[i])) return 0;
+    if (!rword(where, p, g_rfield[4], "pattern")) return 0;
+    if (!rnum(where, p, g_rfield[5], &sync)) return 0;
+    if (!rnum(where, p, g_rfield[6], &rep)) return 0;
+    for (int i = 0; i < 3; i++)
+        if (!rnum(where, p, g_rfield[7 + i], &pcur[i])) return 0;
+    for (int i = 0; i < 4; i++)
+        if (!rnum(where, p, g_rfield[10 + i], &tt[i])) return 0;
+    for (int i = 0; i < 3; i++)
+        if (!rnum(where, p, g_rfield[14 + i], &pt0[i])) return 0;
+    if (*p) {
+        LOGI("warn: [conf] %s: %s after the %d preset fields", where,
+             **p ? "trailing text" : "empty field", RN_FIELDS);
+        return 0;
     }
 
-    if (cap < 0) {
-        /* No cap token at all: the tail starts with something that is not
-         * an int. Nothing gets synthesized, the rule degrades to
-         * colour-only. Say so - this is the shape a version mismatch
-         * between the GUI and the daemon produces. */
-        LOGW("[conf] rule %s: preset tail starts with a non-number, "
-             "colour-only kept: %s", pkg, tail);
-        g_nbroken++;
+    kv_put(sec, "mode", mode);
+    snprintf(s, sizeof(s), "%s.solid", sec);
+    kvt(s, "cur", scur);
+    snprintf(s, sizeof(s), "%s.pattern", sec);
+    kvi(s, "sync", sync);
+    kvi(s, "repeat", rep);
+    kvi(s, "cur_r", pcur[0]);
+    kvi(s, "cur_g", pcur[1]);
+    kvi(s, "cur_b", pcur[2]);
+    kvi(s, "rise", tt[0]);
+    kvi(s, "hold", tt[1]);
+    kvi(s, "fall", tt[2]);
+    kvi(s, "offt", tt[3]);
+    kvt(s, "t0", pt0);
+    return 1;
+}
+
+/* The render= line of a section that owns a renderer: the colour triple
+ * becomes the colour that section paints in (and, for the shared [notify],
+ * the colour every app without a [rules] entry gets), the 17 fields after
+ * it become the chip keys. */
+static void preset_line(const char *sec, const char *val)
+{
+    char where[160], col[64];
+    const char *tail = NULL;
+    int r, g, b;
+    snprintf(where, sizeof(where), "[%s] render", sec);
+    if (!split_color(val, col, &tail)) {
+        LOGI("warn: [conf] %s: want <r,g,b> then %d preset fields, got: \"%s\"",
+             where, RN_FIELDS, val);
         return;
     }
-    if (p) {
-        /* The cursor stopped mid-tail: the first unparsable token ends
-         * the stream and everything after it was dropped. Report what is
-         * left so the bad token is visible instead of guessed. */
-        LOGW("[conf] rule %s: preset tail broken at token \"%s\", "
-             "the rest was ignored", pkg, p);
-        g_nbroken++;
+    if (!parse_rgb(col, &r, &g, &b)) {
+        LOGI("warn: [conf] %s: colour \"%s\" is not r,g,b in 0..255", where, col);
+        return;
     }
+    kv_put(sec, "color", col);
+    if (!strcmp(sec, "notify")) {
+        g_ntf_r = r; g_ntf_g = g; g_ntf_b = b;
+        g_ntf_set = 1;
+    }
+    render_synth(where, sec, &tail);
+}
 
-    char b[sizeof(g_kv[0].sec)];
-    char s[sizeof(g_kv[0].sec)];
-    char triple[64];
+/* An extended [rules] line carries that app's OWN notify preset: the cap
+ * token, then the 17 preset fields (its colour is the first three tokens
+ * of the rules line, already parsed). The whole thing is synthesized into
+ * a [notify.<pkg>] section, so notify.c reads it like any other preset.
+ * A tail that does not rebuild completely is dropped as a whole: the rule
+ * keeps its colour and runs against the shared [notify] preset instead of
+ * painting from a half-read line. */
+static void rule_synth(const char *pkg, const char *tail)
+{
+    char where[160], b[sizeof(g_kv[0].sec)], s[sizeof(g_kv[0].sec)];
+    const char *p = tail;
+    long cap;
+
+    snprintf(where, sizeof(where), "rule %s", pkg);
     snprintf(b, sizeof(b), "notify.%s", pkg);
+
+    /* a second line for the same package must not inherit the presets of
+     * the first one, so every section this preset owns starts empty */
     kv_clear_sec(b);
     snprintf(s, sizeof(s), "%s.solid", b);    kv_clear_sec(s);
     snprintf(s, sizeof(s), "%s.pattern", b);  kv_clear_sec(s);
-    snprintf(s, sizeof(s), "%s.breath", b);   kv_clear_sec(s);
-    snprintf(s, sizeof(s), "%s.wave", b);     kv_clear_sec(s);
 
-    kvi(b, "notif_max_sec", cap);
-    if (mode[0]) kv_put(b, "mode", mode);
-
-    if (scur[2] >= 0) {
-        snprintf(s, sizeof(s), "%s.solid", b);
-        snprintf(triple, sizeof(triple), "%ld,%ld,%ld", scur[0], scur[1], scur[2]);
-        kv_put(s, "cur", triple);
+    if (!rnum(where, &p, "max_sec", &cap) || !render_synth(where, b, &p)) {
+        LOGI("warn: [conf] %s: preset dropped, the rule runs colour-only "
+             "against [notify]", where);
+        g_nbroken++;
+        return;
     }
-
-    if (shared) {
-        if (psync >= 0 || prep >= 0 || pcur[2] >= 0 || prise >= 0 || phold >= 0 ||
-            pfall >= 0 || pofft >= 0 || pt0[2] >= 0) {
-            snprintf(s, sizeof(s), "%s.pattern", b);
-            if (psync >= 0) kvi(s, "sync", psync);
-            if (prep >= 0) kvi(s, "repeat", prep);
-            if (pcur[2] >= 0) {
-                kvi(s, "cur_r", pcur[0]);
-                kvi(s, "cur_g", pcur[1]);
-                kvi(s, "cur_b", pcur[2]);
-            }
-            if (prise >= 0) kvi(s, "rise", prise);
-            if (phold >= 0) kvi(s, "hold", phold);
-            if (pfall >= 0) kvi(s, "fall", pfall);
-            if (pofft >= 0) kvi(s, "offt", pofft);
-            if (pt0[2] >= 0) {
-                snprintf(triple, sizeof(triple), "%ld,%ld,%ld", pt0[0], pt0[1], pt0[2]);
-                kv_put(s, "t0", triple);
-            }
-        }
-    } else {
-        if (bsync >= 0 || brep >= 0 || bcur[2] >= 0 || brise >= 0 || bhold >= 0 ||
-            bfall >= 0 || bofft >= 0) {
-            snprintf(s, sizeof(s), "%s.breath", b);
-            if (bsync >= 0) kvi(s, "sync", bsync);
-            if (brep >= 0) kvi(s, "repeat", brep);
-            if (bcur[2] >= 0) {
-                kvi(s, "cur_r", bcur[0]);
-                kvi(s, "cur_g", bcur[1]);
-                kvi(s, "cur_b", bcur[2]);
-            }
-            if (brise >= 0) kvi(s, "rise", brise);
-            if (bhold >= 0) kvi(s, "hold", bhold);
-            if (bfall >= 0) kvi(s, "fall", bfall);
-            if (bofft >= 0) kvi(s, "offt", bofft);
-        }
-        if (wsync >= 0 || wrep >= 0 || wt0[2] >= 0 || wrise >= 0 || whold >= 0 ||
-            wfall >= 0 || wofft >= 0) {
-            snprintf(s, sizeof(s), "%s.wave", b);
-            if (wt0[2] >= 0) {
-                snprintf(triple, sizeof(triple), "%ld,%ld,%ld", wt0[0], wt0[1], wt0[2]);
-                kv_put(s, "t0", triple);
-            }
-            if (wsync >= 0) kvi(s, "sync", wsync);
-            if (wrep >= 0) kvi(s, "repeat", wrep);
-            if (wrise >= 0) kvi(s, "rise", wrise);
-            if (whold >= 0) kvi(s, "hold", whold);
-            if (wfall >= 0) kvi(s, "fall", wfall);
-            if (wofft >= 0) kvi(s, "offt", wofft);
-        }
-    }
+    kvi(b, "max_sec", cap);
 }
 
 /* parse one key=value line into section (built-in sections only);
@@ -454,55 +494,31 @@ static void rule_synth(const char *pkg, const char *tail)
 static void parse_value(const char *sec, const char *key, const char *val)
 {
     int r, g, b;
+    long v;
     if (!strcmp(sec, "charge")) {
-        if      (!strcmp(key, "first_threshold")) {
-            g_first_at = atoi(val);
-            /* order-free: keep first <= second */
-            if (g_first_at > g_second_at) {
-                int t = g_first_at; g_first_at = g_second_at; g_second_at = t;
-            }
-        }
-        else if (!strcmp(key, "second_threshold")) {
-            g_second_at = atoi(val);
-            if (g_first_at > g_second_at) {
-                int t = g_first_at; g_first_at = g_second_at; g_second_at = t;
-            }
-        }
-        return;
-    }
-    if (!strcmp(sec, "notify")) {
-        if      (!strcmp(key, "default_color")) {
-            if (parse_rgb(val, &r, &g, &b)) {
-                g_ntf_r = r; g_ntf_g = g; g_ntf_b = b;
+        int *slot = NULL;
+        if      (!strcmp(key, "first_threshold"))  slot = &g_first_at;
+        else if (!strcmp(key, "second_threshold")) slot = &g_second_at;
+        if (slot) {
+            if (parse_int(val, &v) && v >= 1 && v <= 100) {
+                *slot = (int)v;
             } else {
-                LOGI("conf: bad [notify] default_color=%s (want r,g,b)", val);
+                LOGI("warn: [conf] bad [charge] %s=%s (want 1..100) - "
+                     "charge stays off until it is fixed", key, val);
             }
         }
-        else if (!strcmp(key, "notif_max_sec")) g_notif_max = atol(val);
         return;
     }
     if (!strcmp(sec, "rules")) {
-        /* extended line  pkg=r,g,b[,cap[,mode[,...]]]: the colour is the
-         * FIRST THREE comma tokens; the optional preset tail is everything
-         * after the 3rd comma. The triple is copied out for parse_rgb, the
-         * tail is absorbed into the synthetic [notify.<pkg>] section. */
+        /* extended line  pkg=r,g,b,cap,<17 preset fields>: the colour is
+         * the FIRST THREE comma tokens; the optional preset tail is
+         * everything after the 3rd comma. The triple is copied out for
+         * parse_rgb, the tail is absorbed into the synthetic
+         * [notify.<pkg>] section. */
         const char *orig = val;
         const char *tail = NULL;
         char col[64];
-        const char *p = val;
-        for (int i = 0; i < 3; i++) {
-            const char *c = strchr(p, ',');
-            if (!c) break;              /* colour-only line, keep entire val */
-            p = c + 1;
-            if (i == 2) tail = p;
-        }
-        if (tail) {
-            size_t n = (size_t)(p - val) - 1;
-            if (n >= sizeof(col)) n = sizeof(col) - 1;
-            memcpy(col, val, n);
-            col[n] = '\0';
-            val = col;
-        }
+        if (split_color(val, col, &tail)) val = col;
         if (!parse_rgb(val, &r, &g, &b)) {
             LOGI("conf: bad [rules] %s=%s (want r,g,b first)", key, orig);
             return;
@@ -523,12 +539,50 @@ static void parse_value(const char *sec, const char *key, const char *val)
             g_rules[g_nrules].b = b;
             g_nrules++;
         } else if (!present) {
-            LOGW("[conf] rules table full (%d), dropped rule %s", MAX_RULES, key);
+            LOGI("warn: [conf] rules table full (%d), dropped rule %s", MAX_RULES, key);
         }
-        /* color-only lines keep the shared legacy preset; extended lines
-         * synthesize a per-package section (a broken tail falls back to
-         * color-only behaviour inside rule_synth) */
+        /* a colour-only line keeps the shared [notify] preset; an extended
+         * line builds its own (a tail that does not rebuild falls back to
+         * colour-only inside rule_synth) */
         if (tail) rule_synth(key, tail);
+    }
+}
+
+/* One logical line - comments already cut, continuations already joined.
+ * Blank lines are the caller's business. */
+static void parse_line(char *sec, size_t seclen, char *line)
+{
+    trim(line);
+    if (!*line) return;
+    if (line[0] == '[') {
+        char *p = strchr(line, ']');
+        if (!p) return;
+        *p = '\0';
+        snprintf(sec, seclen, "%s", line + 1);
+        return;
+    }
+    if (!strcmp(sec, "suppress")) {
+        if (!in_supp(line) && g_nsupp < MAX_SUPP)
+            snprintf(g_supp[g_nsupp++], sizeof(g_supp[0]), "%s", line);
+        else if (!in_supp(line))
+            LOGI("warn: [conf] suppress list full (%d), dropped %s", MAX_SUPP, line);
+        return;
+    }
+    char *eq = strchr(line, '=');
+    if (eq && (eq > line)) {
+        *eq = '\0';
+        trim(line);
+        char *val = eq + 1;
+        trim(val);
+        /* every key lands in the table - except [rules], whose lines
+         * parse_value owns (extended ones become the synthetic
+         * [notify.<pkg>] sections instead), and except render=, which
+         * is the expanded form of the chip keys preset_line writes */
+        if (strcmp(sec, "rules") != 0) {
+            if (!strcmp(line, "render")) preset_line(sec, val);
+            else                          kv_put(sec, line, val);
+        }
+        parse_value(sec, line, val); /* built-in sections apply it    */
     }
 }
 
@@ -537,59 +591,79 @@ static void load_file(void)
     reset_dynamic();
     FILE *f = fopen(CONF_PATH, "r");
     if (!f) {
-        LOGI("conf: no %s, using builtins", CONF_PATH);
+        LOGI("conf: no %s - every effect stays dark until it exists", CONF_PATH);
         return;
     }
     char sec[128] = "";
-    char line[512];
-    while (fgets(line, sizeof(line), f)) {
-        trim(line);
-        if (!*line || line[0] == '#' || line[0] == ';') continue;
-        if (line[0] == '[') {
-            char *p = strchr(line, ']');
-            if (!p) continue;
-            *p = '\0';
-            snprintf(sec, sizeof(sec), "%s", line + 1);
-            continue;
+    char raw[512], logical[1024];
+    logical[0] = '\0';
+    int broken = 0, open = 0;
+    while (fgets(raw, sizeof(raw), f)) {
+        /* a physical line longer than raw[]: drain its tail so the rest
+         * cannot be read as a line of its own, and drop the whole value */
+        if (!strchr(raw, '\n') && !feof(f)) {
+            int c;
+            while ((c = fgetc(f)) != EOF && c != '\n') { }
+            broken = 1;
         }
-        if (!strcmp(sec, "suppress")) {
-            if (!in_supp(line) && g_nsupp < MAX_SUPP)
-                snprintf(g_supp[g_nsupp++], sizeof(g_supp[0]), "%s", line);
-            else if (!in_supp(line))
-                LOGW("[conf] suppress list full (%d), dropped %s", MAX_SUPP, line);
-            continue;
-        }
-        char *eq = strchr(line, '=');
-        if (eq && (eq > line)) {
-            *eq = '\0';
-            trim(line);
-            char *val = eq + 1;
-            trim(val);
-            /* every key lands in the table - except [rules], whose lines
-             * parse_value owns (extended ones become the synthetic
-             * [notify.<pkg>] sections instead) */
-            if (strcmp(sec, "rules") != 0)
-                kv_put(sec, line, val);
-            parse_value(sec, line, val); /* built-in sections apply it    */
-        }
+        strip_comment(raw);
+        int more = cut_continuation(raw);
+        /* a comment or blank line inside a continuation is part of it */
+        if (open && !more && !*raw) continue;
+        if (!line_append(logical, sizeof(logical), raw)) broken = 1;
+        open = more;
+        if (more) continue;
+        if (broken) LOGI("warn: [conf] over-long line dropped: \"%.32s\"", logical);
+        else        parse_line(sec, sizeof(sec), logical);
+        logical[0] = '\0';
+        broken = 0;
     }
-    /* record the mtime this load saw so a later identical write (a saved
+    /* the file ended inside a continuation: what arrived IS the line */
+    if (logical[0] && !broken) parse_line(sec, sizeof(sec), logical);
+/* record the mtime this load saw so a later identical write (a saved
      * config is rewritten with a new mtime, so a true "same content"
      * rewrite still differs here) can be deduped against by the reload
      * guard in core.c */
     struct stat st;
     if (fstat(fileno(f), &st) == 0) g_last_mtime = st.st_mtime;
     fclose(f);
+
+    /* Charge is a two-key pair, so it can only be judged once both lines
+     * are in. An inverted or half-written pair is a broken preset, not
+     * something to repair by swapping: drop both so charge goes dark and
+     * the operator sees which file line to fix. */
+    if (g_first_at != ABSENT && g_second_at != ABSENT &&
+        g_first_at > g_second_at) {
+        LOGI("warn: [conf] [charge] first_threshold=%d > second_threshold=%d - "
+             "charge stays off until the pair is fixed",
+             g_first_at, g_second_at);
+        g_first_at = ABSENT;
+        g_second_at = ABSENT;
+    }
+
     /* [led] logging -> logger toggle. The switch only applies here, on a
      * real reload (inotify event or SIGALRM from the GUI); log_line() does
      * NOT re-read config itself. The LOGI below intentionally comes after
-     * the toggle applies. */
+     * the toggle applies. logging=1 is the only value this file decides
+     * for itself: with logging off there would be no channel to report a
+     * missing logging key through. */
     g_logging = (conf_get_int("led", "logging", 1) != 0);
     log_set_enabled(g_logging);
     LOGI("conf: loaded %s (%d suppressed, %d rules) logging=%d",
          CONF_PATH, g_nsupp, g_nrules, g_logging);
+
+    /* One summary of every key this load could not resolve, so a broken
+     * led.conf is diagnosable from the log alone instead of by noticing
+     * that an event stays dark. */
+    int nmissing = 0;
+    if (g_first_at == ABSENT || g_second_at == ABSENT) nmissing++;
+    if (!g_ntf_set) nmissing++;
+    if (nmissing)
+        LOGI("warn: [conf] %d required key(s) unresolved (charge "
+             "thresholds, notify render colour) - the matching effects "
+             "stay dark", nmissing);
     if (g_nbroken)
-        LOGW("[conf] %d rule(s) had an unreadable preset tail - "
+        LOGI("warn: [conf] %d rule(s) had an unreadable preset tail - "
              "they run colour-only until led.conf is rewritten", g_nbroken);
 }
 
@@ -599,9 +673,9 @@ static void load_file(void)
  * (any writer: GUI, a root shell, OK-file browsers). The only readers of
  * this are conf_maybe_reload() and the signal path, single-threaded. */
 static int  g_conf_dirty  = 0;
-/* load_file() has run at least once (mirrors the old "mtime != 0" probe:
- * a fresh daemon must load on its FIRST lookup without waiting for an
- * event, and a config that vanishes at runtime must fall back to builtins). */
+/* load_file() has run at least once: a fresh daemon must load on its FIRST
+ * lookup without waiting for an event, and a config that vanishes at runtime
+ * must fall back to every value being absent. */
 static int  g_conf_loaded = 0;
 
 void conf_note_change(void)
@@ -649,14 +723,14 @@ void conf_watch_handle(void)
 void conf_maybe_reload(void)
 {
     if (g_cfg_fd >= 0) {
-        /* event-driven path: no stat() in the hot loop at all */
+        /* event-driven path */
         if (!g_conf_dirty && g_conf_loaded) return;
         g_conf_dirty = 0;
         g_conf_loaded = 1;
-        load_file();        /* resets to builtins; logs when file is gone */
+        load_file();        /* logs when the file is gone */
         return;
     }
-    /* fallback (inotify init failed): old stat()-based lazy probe */
+    /* fallback (inotify init failed): lazy probe */
     struct stat st;
     if (stat(CONF_PATH, &st) != 0) {
         if (g_last_mtime != 0) { reset_dynamic(); g_last_mtime = 0; }
@@ -669,11 +743,9 @@ void conf_maybe_reload(void)
 
 /* reload guard for core.c: a single file rewrite can surface as several
  * flags (one inotify burst chunked by the kernel + the GUI's SIGALRM poke,
- * which always comes after the write). Every flag used to load the file,
- * so one save printed a burst of 2-4 identical "conf: loaded" lines. The
- * guard admits only the first flag for a given mtime - N writes now mean
- * exactly N loads. Sees the file as changed on the very first use too
- * (g_last_mtime starts at 0). */
+ * which always comes after the write). The guard admits only the first flag
+ * for a given mtime, so N writes mean exactly N loads. Sees the file as
+ * changed on the very first use too (g_last_mtime starts at 0). */
 int conf_file_changed(void)
 {
     struct stat st;
@@ -691,36 +763,39 @@ int conf_suppressed(const char *pkg)
     return in_supp(pkg);
 }
 
-/* returns 1 and the r,g,b colour if the package has a rule (builtin or
- * config overridden), 0 otherwise (core falls back to the default colour) */
+/* returns 1 and the r,g,b colour if the package has a [rules] entry in
+ * led.conf, 0 otherwise (caller falls back to the default colour) */
 int conf_pkg_rgb(const char *pkg, int *r, int *g, int *b)
 {
     conf_maybe_reload();
     return rule_rgb(pkg, r, g, b);
 }
 
-
+/* Charge thresholds. ABSENT (-1) means the file did not define the key
+ * or defined it badly - charge.c drops the event and logs. Never treat
+ * these as usable numbers without checking for ABSENT. */
 int conf_first_threshold(void)
 {
-	conf_maybe_reload(); return g_first_at;
+    conf_maybe_reload(); return g_first_at;
 }
 
 int conf_second_threshold(void)
 {
-	conf_maybe_reload(); return g_second_at;
+    conf_maybe_reload(); return g_second_at;
 }
 
-
-void conf_notif_rgb(int *r, int *g, int *b)
+/* [notify] preset colour: the colour triple of the section's render line.
+ * Returns 1 and fills r,g,b, or 0 when the file has no usable one - the
+ * caller must drop. */
+int conf_notif_rgb(int *r, int *g, int *b)
 {
-    conf_maybe_reload(); *r = g_ntf_r; *g = g_ntf_g; *b = g_ntf_b;
+    conf_maybe_reload();
+    if (!g_ntf_set) return 0;
+    *r = g_ntf_r; *g = g_ntf_g; *b = g_ntf_b;
+    return 1;
 }
 
 
-long conf_notif_max_sec(void)
-{
-	conf_maybe_reload(); return g_notif_max;
-}
 
 /* ---------------- generic value lookups for mod-owned sections ---------------- */
 
@@ -734,7 +809,10 @@ const char *conf_get_str(const char *sec, const char *key)
     return NULL;
 }
 
-/* integer value for (sec,key), def if absent or unparsable */
+/* integer value for (sec,key), def if absent or unparsable.
+ * Only for the one value the daemon may decide for itself ([led]
+ * logging - a missing logging key has no channel to complain through).
+ * Every POLICY value must go through conf_req_int instead. */
 long conf_get_int(const char *sec, const char *key, long def)
 {
     const char *v = conf_get_str(sec, key);
@@ -742,6 +820,56 @@ long conf_get_int(const char *sec, const char *key, long def)
     long x = atol(v);
     if (!x && (v[0] < '0' || v[0] > '9') && v[0] != '-') return def;
     return x;
+}
+
+/* ---------------- required keys: drop + log ---------------- */
+
+/* report a required key that could not be resolved, once per reload */
+static void req_warn(const char *sec, const char *key, const char *why)
+{
+    char id[160];
+    snprintf(id, sizeof(id), "[%s] %s", sec, key);
+    for (int i = 0; i < g_nreqwarn; i++)
+        if (!strcmp(g_reqwarn[i], id)) return;
+    if (g_nreqwarn < MAX_REQWARN)
+        snprintf(g_reqwarn[g_nreqwarn++], sizeof(g_reqwarn[0]), "%s", id);
+    LOGI("warn: [conf] required key %s %s - affected events are dropped",
+         id, why);
+}
+
+/* Required integer. Returns 1 and fills out only when the file defines a
+ * whole number inside [lo,hi]. Absent, unparsable or out of range
+ * returns 0 after a once-only log; the caller must drop the event. */
+int conf_req_int(const char *sec, const char *key, long lo, long hi, long *out)
+{
+    const char *v = conf_get_str(sec, key);
+    if (!v) { req_warn(sec, key, "is not set"); return 0; }
+    long x;
+    if (!parse_int(v, &x)) { req_warn(sec, key, "is not a number"); return 0; }
+    if (x < lo || x > hi) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "=%ld is outside %ld..%ld", x, lo, hi);
+        req_warn(sec, key, buf);
+        return 0;
+    }
+    *out = x;
+    return 1;
+}
+
+/* Required "r,g,b" colour, 0..255 per channel: the one the section's
+ * render= line carries. Same contract as conf_req_int: 1 + out, or 0 +
+ * once-only log and a dropped event. */
+int conf_req_color(const char *sec, int out[3])
+{
+    const char *v = conf_get_str(sec, "color");
+    if (!v) { req_warn(sec, "render colour", "is not set"); return 0; }
+    int r, g, b;
+    if (!parse_rgb(v, &r, &g, &b)) {
+        req_warn(sec, "render colour", "is not r,g,b in 0..255");
+        return 0;
+    }
+    out[0] = r; out[1] = g; out[2] = b;
+    return 1;
 }
 
 /* scratch buffer for conf_notify_sec's synthetic section name; returned

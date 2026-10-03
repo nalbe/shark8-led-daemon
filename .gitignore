@@ -22,3 +22,6 @@ Desktop.ini
 .tmp
 .git
 release
+
+# Local agent config
+AGENTS.md

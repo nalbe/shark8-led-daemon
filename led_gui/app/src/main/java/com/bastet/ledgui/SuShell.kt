@@ -10,10 +10,8 @@ import java.nio.charset.StandardCharsets
  * the app, commands are fed through stdin and answers are read back with
  * unique markers.
  *
- * The old Su.run spawned a fresh su process per command (6-7 per status
- * poll, on top of untrusted-app sysfs reads that tripped SELinux audit).
- * A shell that stays alive removes those syscalls from the render path
- * and makes frequent live reads cheap.
+ * A shell that stays alive keeps the untrusted-app sysfs reads out of the
+ * render path and makes frequent live reads cheap.
  */
 class RootShell {
 
@@ -62,7 +60,7 @@ class RootShell {
      *
      * Synchronized so concurrent callers (status poll + config reload on
      * the SAME shared main shell) can't interleave commands and garble the
-     * response markers - that used to surface as a bogus "no root yet".
+     * response markers.
      */
     @Synchronized
     fun exec(cmd: String, timeoutMs: Long = 4000): String {
@@ -101,14 +99,12 @@ class RootShell {
 object SuShell {
 
     /**
-     * Two independent persistent root shells:
-     *  - main: status polls, hooks, config load/save. Must stay responsive.
-     *  - live: cheap frequent brightness reads. While the daemon blasts the
-     *    sysfs rgb files (rainbow/charge animations) a read can stall for
-     *    a while; keeping it on its own shell keeps the status ticking.
+     * The one persistent root shell: status polls, hooks, config load/save,
+     * and every live brightness read all go through it. A slow read only
+     * ever stalls the caller that asked for it, and exec() drops the
+     * leftovers on timeout so the next command starts from a clean buffer.
      */
     val main = RootShell()
-    val live = RootShell()
 
     /** Kept for callers wired to the shared main shell only. */
     fun exec(cmd: String, timeoutMs: Long = 4000): String = main.exec(cmd, timeoutMs)

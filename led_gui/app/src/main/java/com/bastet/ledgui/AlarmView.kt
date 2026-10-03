@@ -10,7 +10,7 @@ class AlarmView(context: Context) : ConfPage(context) {
     override fun buildBody() {
         knobs = EventKnobs(
             "Alarm", "Alarm renderer",
-            "Shown when com.android.deskclock / com.google.android.deskclock fires.",
+            "Shown while a clock app's ringing notification is up.",
             capLabel = "max sec (0 == inf)"
         )
         body.addView(knobs)

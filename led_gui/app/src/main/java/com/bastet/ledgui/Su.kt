@@ -23,10 +23,6 @@ object Su {
         val pending: Boolean get() = code == -1
     }
 
-    /** True when some su binary answers with uid=0. */
-    val isRootAvailable: Boolean
-        get() = run("id").out.contains("uid=0")
-
     fun run(cmd: String, timeoutSec: Long = 10): Result {
         // Fast path: one persistent root shell handles every command on a
         // stdin/stdout pipe - no per-call su fork, no fresh supervisor
