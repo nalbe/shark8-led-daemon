@@ -6,7 +6,7 @@ import java.util.Locale
 
 /**
  * Live state from /data/local/tmp/led_status written by the daemon.
- * Format: ts / mode (charge|notify|ring|voip|missed|alarm) / band
+ * Format: ts / mode (idle|charge|notify|ring|voip|missed|alarm) / band
  * (lower|middle|upper|none) / pkg / color=r,g,b / engine.
  *
  * engine tells how the LED is ACTUALLY driven, which decides whether a
@@ -34,9 +34,8 @@ data class LedStatus(
             SimpleDateFormat("HH:mm:ss", Locale.US).format(Date(ts * 1000))
         } else "-"
 
-    /** True when some owner is actively driving the LED. A daemon in the
-     *  off state still reports mode=charge/notify with band=none and an
-     *  empty pkg - that is NOT armed. */
+    /** True when some owner is actively driving the LED; mode=idle is the
+     *  daemon's own word for a dark chip. */
     val isArmed: Boolean
         get() = mode.isNotEmpty() && mode != "!" &&
             (pkg.isNotEmpty() || (band.isNotEmpty() && band != "none"))

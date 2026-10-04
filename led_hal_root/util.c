@@ -165,7 +165,8 @@ void nls_status_write(int connected)
 }
 
 /* Write the current LED-owner state for external consumers (GUI etc.).
- * mode: charge | notify | ring | voip | missed | alarm
+ * mode: idle | charge | notify | ring | voip | missed | alarm (idle = the
+ *   chip is dark, whoever the pool elected)
  * band: lower/middle/upper/none (charge only, "" otherwise)
  * pkg:  armed notification / ring / voip pseudo-package, "" when none
  * engine: how the LED is actually driven - tells a consumer whether the

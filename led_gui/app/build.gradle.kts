@@ -24,6 +24,13 @@ android {
         jvmTarget = "17"
     }
 
+    // lintVital runs a full lint pass inside every assembleRelease; this app
+    // is hand-built and installed over adb, so that CPU buys nothing.
+    lint {
+        checkReleaseBuilds = false
+        abortOnError = false
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true

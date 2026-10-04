@@ -237,7 +237,7 @@ static struct evt *ev_slot(void)
 static void ev_drop(struct evt *e, const char *why)
 {
     char who[EV_LOG_NAME];
-    LOGI("pool: %s dropped (%s, lit=%ldms)", ev_name(e, who), why, e->shown_ms);
+    LOGI("pool: %s dropped (%s, lit=%ldms)", ev_name(e, who), why, lit_ms(e));
     if (e == g_show) {
         bank_show(e);
         g_show = NULL;
@@ -441,7 +441,12 @@ static int paint_entry(struct evt *e)
     if (e->k->paint && e->k->paint(e, &p))
         engine = led_event(p.sec[0] ? p.sec : NULL, p.r, p.g, p.b);
     if (!engine) return 0;
-    status_write(e->k->name, p.band, p.label, p.r, p.g, p.b, engine);
+    /* The status file describes the LIGHT, not the pool: whatever module
+     * holds the LEDs, a dark chip is idle. */
+    if (!strcmp(engine, "off"))
+        status_write("idle", "none", "", 0, 0, 0, "off");
+    else
+        status_write(e->k->name, p.band, p.label, p.r, p.g, p.b, engine);
     return 1;
 }
 
@@ -461,7 +466,7 @@ static void pool_select(const char *why)
         if (!want) {
             if (g_show) {
                 LOGI("pool: %s -> idle (%s, lit=%ldms)",
-                     ev_name(g_show, from), why, g_show->shown_ms);
+                     ev_name(g_show, from), why, lit_ms(g_show));
                 bank_show(g_show);
                 g_show = NULL;
                 led_invalidate();

@@ -2,26 +2,24 @@
 rem ============================================================
 rem  install_gui.cmd - build the LED GUI APK (release, R8
 rem  minified, signed with the debug keystore), stage it into
-rem  module\led_gui-release.apk (what customize.sh installs) and
-rem  install it on a connected device. Builds the APK first if it
-rem  is missing.
+rem  module\led_gui-release.apk (what customize.sh installs),
+rem  install it over whatever is on the device and launch it.
+rem  Always rebuilds: a stale APK on disk must never be installed.
 rem ============================================================
-setlocal enabledelayedexpansion
+setlocal
 set "GUI=%~dp0led_gui"
 set "APK=%GUI%\app\build\outputs\apk\release\led_gui-release.apk"
 set "DST=%~dp0module\led_gui-release.apk"
 
-if not exist "%APK%" (
-    echo APK not built - building with gradle...
-    pushd "%GUI%"
-    rem gradlew ships with the project, so it needs nothing from PATH.
-    call gradlew.bat assembleRelease
-    set "RC=!ERRORLEVEL!"
-    popd
-    if not "!RC!"=="0" (
-        echo BUILD FAILED
-        exit /b 1
-    )
+echo Building %APK%
+pushd "%GUI%"
+rem gradlew ships with the project, so it needs nothing from PATH.
+call gradlew.bat assembleRelease
+set "RC=%ERRORLEVEL%"
+popd
+if not "%RC%"=="0" (
+    echo BUILD FAILED
+    exit /b 1
 )
 
 echo Waiting for device...
@@ -40,6 +38,7 @@ if errorlevel 1 goto :fail
 
 echo Launching LED GUI...
 adb shell am start -n com.bastet.ledgui/.MainActivity
+adb shell settings put system accelerometer_rotation 0
 echo INSTALLED AND LAUNCHED
 exit /b 0
 

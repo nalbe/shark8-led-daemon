@@ -70,7 +70,6 @@ class StatusView(context: Context) : LinearLayout(context) {
     private lateinit var ledPkgTv: TextView
     private lateinit var ledSinceTv: TextView
     private lateinit var ledHintTv: TextView
-    private lateinit var ledRendererTv: TextView
     private lateinit var logTv: TextView
     private lateinit var loggingCb: CheckBox
     private lateinit var bridgeTv: TextView
@@ -158,22 +157,7 @@ class StatusView(context: Context) : LinearLayout(context) {
         renderDaemon()
         renderBridge()
         renderLed()
-        renderRenderer()
         logTv.text = logText.ifBlank { "(empty)" }
-    }
-
-    /** Active chip engine (from led_status) + global [led] Imax + the
-     *  armed event's per-channel current from led.conf: what the chip is
-     *  really doing right now. */
-    private fun renderRenderer() {
-        val cur = if (led.isArmed) statusDrive()?.first else null
-        val curTxt = cur?.let { "  cur ${it.first},${it.second},${it.third}" } ?: ""
-        ledRendererTv.text = if (led.engine.isBlank()) {
-            "renderer: (led.status missing - old daemon?)"
-        } else {
-            "renderer: ${led.engine} @ $imax mA (chip)$curTxt"
-        }
-        ledRendererTv.setTextColor(if (led.engine.isBlank()) parse("#FF909090") else parse("#FFB0BEC5"))
     }
 
     /** Resolve the armed event's drive settings from led.conf by status
@@ -362,7 +346,7 @@ class StatusView(context: Context) : LinearLayout(context) {
     }
 
     private fun renderLed() {
-    if (led.mode.isEmpty()) {
+        if (led.mode.isEmpty()) {
             ledModeTv.text = "no /data/local/tmp/led_status (old daemon binary?)"
             ledColorTv.visibility = GONE
             ledLightBandTv.visibility = GONE
@@ -372,54 +356,54 @@ class StatusView(context: Context) : LinearLayout(context) {
             return
         }
         ledColorTv.visibility = VISIBLE
-        ledLightBandTv.visibility = VISIBLE
         ledPkgTv.visibility = VISIBLE
         ledSinceTv.visibility = VISIBLE
-    ledModeTv.text = "mode: ${led.mode}  ${if (led.isArmed) "(armed)" else "(off)"}"
-        ledLightBandTv.text = "band: ${led.band.ifBlank { "-" }}${
-            if (led.engine.isBlank()) "" else "  engine: ${led.engine}"
-        }"
+ledModeTv.text = "mode: ${led.mode}"
+
+        val cur = if (led.isArmed) statusDrive()?.first else null
+        val raw = led.color
+        val hex = if (raw.first >= 0) {
+            String.format(Locale.US, "#%02x%02x%02x", raw.first, raw.second, raw.third)
+        } else ""
+        val curTxt = cur?.let { "; cur: ${it.first},${it.second},${it.third}" } ?: ""
+        // The chip current ceiling only means something while the LED is lit.
+        val imaxTxt = if (imax > 0 && led.isArmed) "; imax: $imax mA" else ""
+        ledColorTv.text = "color: $hex (${raw.first},${raw.second},${raw.third})$curTxt$imaxTxt"
+
+        val band = led.band.takeIf { led.mode == "charge" && it.isNotBlank() && it != "none" }
+        val engine = led.engine.takeIf { it.isNotBlank() }
+        val drive = listOfNotNull(band?.let { "band: $it" }, engine?.let { "engine: $it" })
+        ledLightBandTv.visibility = if (drive.isEmpty()) GONE else VISIBLE
+        ledLightBandTv.text = drive.joinToString("; ")
+
         ledPkgTv.text = "pkg: ${led.pkg.ifBlank { "-" }}"
         ledSinceTv.text = "since: ${led.prettyTime}"
-        updateLedLive()
+        updateLedSwatch()
     }
 
-    private fun updateLedLive() {
+    private fun updateLedSwatch() {
         if (led.mode.isEmpty()) return
-        val sw = ledSwatch.background as? GradientDrawable ?: return
         /* Live color coming OUT of the chip is unreadable: the AW2033
          * executes breath/wave patterns in hardware and exposes no
-         * readback of the instantaneous PWM (regs are write-only). So we
-         * show the CONFIG color the daemon armed, scaled by the event's
-         * per-channel current (LedSim) - the light the combination
+         * readback of the instantaneous PWM (regs are write-only). So the
+         * swatch shows the CONFIG color the daemon armed, scaled by the
+         * event's per-channel current (LedSim) - the light the combination
          * produces. SYNC arms the red master PWM on every channel, so it
          * is modeled too (per-channel cur ratio tints the color).
          * engine in parentheses tells what the chip does. */
         val drive = if (led.isArmed) statusDrive() else null
-        val raw = led.color
         val sim = if (led.isArmed) {
-            LedSim.rgbWithCurrent(raw, drive?.first ?: Triple(15, 15, 15), drive?.second ?: false)
+            LedSim.rgbWithCurrent(led.color, drive?.first ?: Triple(15, 15, 15), drive?.second ?: false)
         } else Triple(-1, -1, -1)
+        val sw = ledSwatch.background as? GradientDrawable ?: return
         sw.gradientType = GradientDrawable.LINEAR_GRADIENT
         sw.setColor(
             if (sim.first >= 0) Color.rgb(sim.first, sim.second, sim.third)
             else Color.DKGRAY
         )
-        val hex = if (raw.first >= 0) {
-            String.format(Locale.US, "#%02X%02X%02X", raw.first, raw.second, raw.third)
-        } else ""
-        val simHex = if (sim.first >= 0 && sim != raw) {
-            String.format(Locale.US, "  sim #%02X%02X%02X", sim.first, sim.second, sim.third)
-        } else ""
-        val newText = if (led.engine.isEmpty()) {
-            "color: $hex  (${raw.first},${raw.second},${raw.third})$simHex"
-        } else {
-            "color: $hex  (${raw.first},${raw.second},${raw.third})$simHex  [${led.engine}]"
-        }
-        if (ledColorTv.text.toString() != newText) ledColorTv.text = newText
-        val pattern = led.engine == "wave" || led.engine == "breath"
-        ledHintTv.visibility = if (pattern && led.isArmed) VISIBLE else GONE
-        if (ledHintTv.visibility == VISIBLE) {
+        val pattern = led.isArmed && (led.engine == "wave" || led.engine == "breath")
+        ledHintTv.visibility = if (pattern) VISIBLE else GONE
+        if (pattern) {
             ledHintTv.text = if (led.engine == "wave") {
                 "traveling wave runs on the AW2033 chip (hardware pattern)"
             } else {
@@ -565,8 +549,8 @@ class StatusView(context: Context) : LinearLayout(context) {
             rootHintTv = text("", 13f, parse("#FF909090"))
             addView(rootHintTv)
             addView(spacer(4))
-            requestBtn = filledBtn("Request root") { requestRoot() }
-            addView(row(requestBtn, outlinedBtn("Open KernelSU Manager") {
+            requestBtn = btn("Request root") { requestRoot() }
+            addView(row(requestBtn, btn("Open KernelSU Manager") {
                 openRootManager(context)
             }))
         })
@@ -579,8 +563,8 @@ class StatusView(context: Context) : LinearLayout(context) {
             addView(pidTv)
             addView(spacer(8))
             addView(row(
-                filledBtn("Refresh") { refreshNow() },
-                outlinedBtn("Restart") {
+                btn("Refresh") { refreshNow() },
+                btn("Restart") {
                     scope.launch {
                         val snap = withContext(Dispatchers.IO) {
                             Su.run(
@@ -594,7 +578,7 @@ class StatusView(context: Context) : LinearLayout(context) {
                         applySnap(snap)
                     }
                 },
-                outlinedBtn("Config") { openLedConf() }
+                btn("Config") { openLedConf() }
             ))
                 addView(spacer(4))
             addView(text(
@@ -612,9 +596,9 @@ class StatusView(context: Context) : LinearLayout(context) {
             addView(bridgeTv)
             addView(spacer(4))
             addView(row(
-                filledBtn("Notification access") { openNlsSettings() },
-                outlinedBtn("Config") { openBridgeConfig() },
-                outlinedBtn("Refresh") { refreshBridge() }
+                btn("Notification access") { openNlsSettings() },
+                btn("Config") { openBridgeConfig() },
+                btn("Refresh") { refreshBridge() }
             ))
             addView(spacer(4))
             addView(text(
@@ -624,7 +608,7 @@ class StatusView(context: Context) : LinearLayout(context) {
             ))
         })
 
-        // --- LED + test hooks card
+        // --- LED state card
         content.addView(card {
             addView(sectionTitle("LED state"))
             addView(spacer(6))
@@ -637,22 +621,20 @@ class StatusView(context: Context) : LinearLayout(context) {
             ledSwatch.layoutParams = LayoutParams(dpi(30), dpi(30))
             val liveCol = LinearLayout(context)
             liveCol.orientation = VERTICAL
-    ledModeTv = text("")
+            ledModeTv = text("")
             ledColorTv = text("", 13f, parse("#FFB0BEC5"), mono = true)
             ledLightBandTv = text("")
             ledPkgTv = text("")
             ledSinceTv = text("")
             ledHintTv = text("", 12f, parse("#FFEF6C00"))
             ledHintTv.visibility = GONE
-            ledRendererTv = text("", 13f, parse("#FFB0BEC5"), mono = true)
             liveCol.addView(ledModeTv)
             liveCol.addView(ledColorTv)
             liveCol.addView(ledLightBandTv)
             liveCol.addView(ledPkgTv)
             liveCol.addView(ledSinceTv)
             liveCol.addView(ledHintTv)
-            liveCol.addView(ledRendererTv)
-            val ledRow = row(ledSwatch, liveCol)
+            val ledRow = row(ledSwatch, liveCol, gravity = Gravity.TOP)
             for (i in 0 until ledRow.childCount) {
                 val c = ledRow.getChildAt(i)
                 if (i > 0) {
@@ -662,21 +644,24 @@ class StatusView(context: Context) : LinearLayout(context) {
                 }
             }
             addView(ledRow)
-            addView(spacer(8))
+        })
+
+        // --- Test hooks card
+        content.addView(card {
             addView(sectionTitle("Test hooks"))
             addView(spacer(6))
             addView(row(
-                filledBtn("notify") { sendHook("USR1") },
-                filledBtn("call") { sendHook("HUP") },
-                filledBtn("voip") { sendHook("WINCH") }
+                btn("notify") { sendHook("USR1") },
+                btn("call") { sendHook("HUP") },
+                btn("voip") { sendHook("WINCH") }
             ))
             addView(spacer(4))
             addView(row(
-                filledBtn("alarm") { sendHook("TSTP") },
-                filledBtn("charge") { sendHook("QUIT") }
+                btn("alarm") { sendHook("TSTP") },
+                btn("charge") { sendHook("QUIT") }
             ))
             addView(spacer(4))
-            addView(row(outlinedBtn("Disarm") { sendHook("USR2") }))
+            addView(row(btn("Disarm") { sendHook("USR2") }))
         })
 
         // --- log card
@@ -684,7 +669,7 @@ class StatusView(context: Context) : LinearLayout(context) {
             val titleLp = LayoutParams(0, wP, 1f)
             val title = sectionTitle("ledd.log (tail)")
             title.layoutParams = titleLp
-            addView(row(title, outlinedBtn("Open") { openLog() }, outlinedBtn("Clear") { clearLog() }))
+            addView(row(title, btn("Open") { openLog() }, btn("Clear") { clearLog() }))
             addView(spacer(6))
             loggingCb = CheckBox(context)
             loggingCb.text = "Logging (daemon writes ledd.log)"
@@ -763,17 +748,9 @@ class StatusView(context: Context) : LinearLayout(context) {
         return l
     }
 
-/** Filled action button: solid body, used for the primary action of a
-     *  row ("Save to device", "Refresh", the test hooks). */
-    private fun filledBtn(label: String, onClick: () -> Unit): Button =
-        actionBtn(label, onClick, parse("#FF242424"))
-
-    /** Outlined action button: transparent body, the secondary action next
-     *  to a filled one ("Reload", "Restart", "Open"). */
-    private fun outlinedBtn(label: String, onClick: () -> Unit): Button =
-        actionBtn(label, onClick, parse("#00000000"))
-
-    private fun actionBtn(label: String, onClick: () -> Unit, fill: Int): Button {
+/** Action button: transparent body, so the card color shows through and
+     *  no button in a row ever reads as a lighter patch. */
+    private fun btn(label: String, onClick: () -> Unit): Button {
         val b = Button(context)
         b.text = label
         b.isAllCaps = false
@@ -782,9 +759,23 @@ class StatusView(context: Context) : LinearLayout(context) {
         val g = GradientDrawable()
         g.shape = GradientDrawable.RECTANGLE
         g.cornerRadius = dpf(8)
-        g.setColor(fill)
+        g.setColor(parse("#FF1E1E1E"))
         g.setStroke(dpi(1), parse("#FF5C6BC0"))
-        b.background = g
+        try {
+            val attrs = intArrayOf(android.R.attr.selectableItemBackground)
+            val ta = context.obtainStyledAttributes(attrs)
+            val ripple = ta.getDrawable(0)
+            ta.recycle()
+            if (ripple != null) {
+                b.background = android.graphics.drawable.LayerDrawable(
+                    arrayOf(g, ripple)
+                )
+            } else {
+                b.background = g
+            }
+        } catch (_: Exception) {
+            b.background = g
+        }
         b.setOnClickListener { onClick() }
         return b
     }
@@ -831,7 +822,7 @@ class StatusView(context: Context) : LinearLayout(context) {
                 line.startsWith("D=") -> daemon = line.substring(2)
                 line.startsWith("G=logging=0") -> logging = false
                 line.startsWith("G=logging=1") -> logging = true
-                line.startsWith("I=imax=") -> imax = line.substringAfter("=").toIntOrNull() ?: 0
+                line.startsWith("I=imax=") -> imax = line.substringAfterLast("=").toIntOrNull() ?: 0
                 line.startsWith("N=connected=1") -> bridgeConnected = true
                 line.startsWith("N=connected=0") -> bridgeConnected = false
                 line == "S<<" -> { section = "S"; sb.clear() }

@@ -558,6 +558,8 @@ not what the LEDs show while the test owns them.
   `color=`/`engine=`, where `engine` (`off`/`solid`/`breath`/`wave`) tells
   a consumer whether the raw brightness node reflects what the eye sees -
   chip-driven patterns read a constant peak, solid reads the real color.
+  `mode=idle` is the daemon's word for a dark chip: whoever holds the pool,
+  a module that renders `off` writes `idle`, not its own name.
 - `/data/local/tmp/notifybridge.status` - bridge connect state
   (`connected=1|0`), written by the daemon on accept/EOF and after every
   reload.

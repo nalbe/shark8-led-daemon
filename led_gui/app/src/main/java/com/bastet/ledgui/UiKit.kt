@@ -159,8 +159,8 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
         val foot = LinearLayout(context)
         foot.orientation = HORIZONTAL
         foot.setPadding(dpi(12), dpi(8), dpi(12), dpi(8))
-        saveBtn = filledBtn("Save to device") { save() }
-        reloadBtn = outlinedBtn("Reload") { reload() }
+        saveBtn = btn("Save to device") { save() }
+        reloadBtn = btn("Reload") { reload() }
         foot.addView(row(saveBtn, reloadBtn))
         col.addView(foot, LayoutParams(mP, wP))
 
@@ -324,7 +324,9 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
         return l
     }
 
-    protected fun filledBtn(label: String, onClick: () -> Unit): Button {
+    /** Action button: transparent body, so the card color shows through and
+     *  no button in a row ever reads as a lighter patch. */
+    protected fun btn(label: String, onClick: () -> Unit): Button {
         val b = Button(context)
         b.text = label
         b.isAllCaps = false
@@ -333,25 +335,23 @@ abstract class ConfPage(context: Context) : LinearLayout(context) {
         val g = GradientDrawable()
         g.shape = GradientDrawable.RECTANGLE
         g.cornerRadius = dpf(8)
-        g.setColor(parse("#FF242424"))
+        g.setColor(parse("#FF1E1E1E"))
         g.setStroke(dpi(1), parse("#FF5C6BC0"))
-        b.background = g
-        b.setOnClickListener { onClick() }
-        return b
-    }
-
-    protected fun outlinedBtn(label: String, onClick: () -> Unit): Button {
-        val b = Button(context)
-        b.text = label
-        b.isAllCaps = false
-        b.setTextColor(parse("#FF90CAF9"))
-        b.textSize = 14f
-        val g = GradientDrawable()
-        g.shape = GradientDrawable.RECTANGLE
-        g.cornerRadius = dpf(8)
-        g.setColor(parse("#FF242424"))
-        g.setStroke(dpi(1), parse("#FF5C6BC0"))
-        b.background = g
+        try {
+            val attrs = intArrayOf(android.R.attr.selectableItemBackground)
+            val ta = context.obtainStyledAttributes(attrs)
+            val ripple = ta.getDrawable(0)
+            ta.recycle()
+            if (ripple != null) {
+                b.background = android.graphics.drawable.LayerDrawable(
+                    arrayOf(g, ripple)
+                )
+            } else {
+                b.background = g
+            }
+        } catch (_: Exception) {
+            b.background = g
+        }
         b.setOnClickListener { onClick() }
         return b
     }
