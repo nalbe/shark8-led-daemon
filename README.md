@@ -47,7 +47,7 @@ only), `install_core.cmd` (build + deploy to device), `install_gui.cmd`
 
 ## Install
 
-1. Download the latest [`led_hal_root-v4.1.zip`](https://github.com/nalbe/shark8-led-daemon/releases/latest) (flashable KernelSU module)
+1. Download the latest [`led_hal_root-v4.4.zip`](https://github.com/nalbe/shark8-led-daemon/releases/latest) (flashable KernelSU module)
 2. Flash in KernelSU Manager -> Modules -> Install from storage
 3. `customize.sh` installs both apps automatically (`pm install -r`,
    non-fatal on failure):
@@ -427,7 +427,6 @@ a key or a section the file is missing is added. Requires root
 `led_gui-release.apk`.
 
 ### Screenshots
-> **Note:** These screenshots are conceptual and may not represent the final product.
 
 <details>
 <summary>Show LED GUI screenshots</summary>
