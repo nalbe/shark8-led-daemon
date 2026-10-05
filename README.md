@@ -308,6 +308,7 @@ CHG <status> <level> [<plugged>]
                       int 2=Charging..5=Full, level 0..100, optional
                       plugged bit, 0 forces the band off)
 PULSE <0|1>           notification_light_pulse changed by any writer
+                       (the only source of the toggle state)
 ```
 
 Every line is one pool call: the kind name comes from the line, the
@@ -315,9 +316,6 @@ package + id are the entry's identity, and the pool decides whether that
 entry may hold the LEDs right now. `MISSED_ON/OFF` carry no package - their
 single field IS the bridge id of the tombstone, and the entry is keyed by
 it, so a removal ends the posting it names and nothing else.
-                        (ONLY source of the toggle state - the daemon
-                        never reads Settings.* itself)
-```
 
 On connect the client **replays its live state** (SCREEN, watched
 settings like PULSE, active RING/VOIP/MISSED, every active ENQ), so a
@@ -427,6 +425,9 @@ a key or a section the file is missing is added. Requires root
 `led_gui-release.apk`.
 
 ### Screenshots
+
+> **Note:** these shots are conceptual - the GUI on the device may look
+> different from what is shown here.
 
 <details>
 <summary>Show LED GUI screenshots</summary>
