@@ -433,19 +433,19 @@ a key or a section the file is missing is added. Requires root
 
 | Info | Charge |
 | --- | --- |
-| <img src="screenshots/01-info.png" width="270"> | <img src="screenshots/02-charge.png" width="270"> |
+| ![Info](screenshots/01-info.png) | ![Charge](screenshots/02-charge.png) |
 
 | Notification | Notification |
 | --- | --- |
-| <img src="screenshots/03-notification.png" width="270"> | <img src="screenshots/04-notification.png" width="270"> |
+| ![Notification](screenshots/03-notification.png) | ![Notification](screenshots/04-notification.png) |
 
 | Notification | Call |
 | --- | --- |
-| <img src="screenshots/05-notification.png" width="270"> | <img src="screenshots/06-call.png" width="270"> |
+| ![Notification](screenshots/05-notification.png) | ![Call](screenshots/06-call.png) |
 
 | VoIP | Alarm |
 | --- | --- |
-| <img src="screenshots/07-voip.png" width="270"> | <img src="screenshots/08-alarm.png" width="270"> |
+| ![VoIP](screenshots/07-voip.png) | ![Alarm](screenshots/08-alarm.png) |
 
 </details>
 
